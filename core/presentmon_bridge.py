@@ -27,6 +27,7 @@ DEFAULT_PRESENTMON_DIR = Path(__file__).parent.parent / "tools" / "PresentMon"
 DEFAULT_PRESENTMON_PATH = DEFAULT_PRESENTMON_DIR / "PresentMon.exe"
 STARTUP_TIMEOUT_MS = 5000
 METRICS_EMIT_INTERVAL_S = 0.2
+LIKELY_UNSUPPORTED_HIGH_PRECISION_TARGETS = {"java.exe", "javaw.exe"}
 
 
 class _PresentMonParser(QObject):
@@ -235,6 +236,9 @@ class PresentMonBridge(QObject):
         if self._target_process:
             return self._target_process
         return "No target"
+
+    def _is_likely_unsupported_high_precision_target(self) -> bool:
+        return (self._target_process or "").strip().lower() in LIKELY_UNSUPPORTED_HIGH_PRECISION_TARGETS
 
     def start_capture(self, force_restart: bool = False):
         if not self.is_available():
@@ -486,6 +490,12 @@ class PresentMonBridge(QObject):
         if self._startup_timeout_notified:
             return
         self._startup_timeout_notified = True
+        if self._is_likely_unsupported_high_precision_target():
+            self.error_occurred.emit(
+                f"No frame data for {self.target_description()}. "
+                "Minecraft 1.8.9 and other legacy Java/OpenGL titles often do not expose PresentMon high-precision frame events."
+            )
+            return
         self._set_status(
             f"No frame data for {self.target_description()} yet. Use the exact .exe name or pick a detected window."
         )

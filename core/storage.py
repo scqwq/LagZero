@@ -15,7 +15,7 @@ from pathlib import Path
 
 from sqlalchemy import (
     Column, Integer, Float, String, DateTime, Text, ForeignKey,
-    create_engine, select
+    create_engine, delete, select
 )
 from sqlalchemy.orm import DeclarativeBase, Session, relationship
 
@@ -175,6 +175,32 @@ class Storage:
         with Session(self._engine) as session:
             from sqlalchemy import func
             return session.scalar(select(func.count()).select_from(LagEventRow)) or 0
+
+    # ------------------------------------------------------------------
+    # Delete
+    # ------------------------------------------------------------------
+
+    def delete_event(self, event_id: int | None) -> bool:
+        if not event_id:
+            return False
+        with Session(self._engine) as session:
+            row = session.get(LagEventRow, event_id)
+            if row is None:
+                return False
+            session.delete(row)
+            session.commit()
+            return True
+
+    def delete_all_events(self) -> int:
+        with Session(self._engine) as session:
+            from sqlalchemy import func
+
+            count = session.scalar(select(func.count()).select_from(LagEventRow)) or 0
+            if count <= 0:
+                return 0
+            session.execute(delete(LagEventRow))
+            session.commit()
+            return int(count)
 
     # ------------------------------------------------------------------
     # Helpers

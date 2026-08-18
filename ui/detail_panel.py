@@ -115,6 +115,7 @@ class DetailPanelWidget(QWidget):
     def _build_empty(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 0, 0, 0)
+        layout.setSpacing(0)
         placeholder = QLabel("← 选择左侧卡顿事件\n查看完整诊断信息")
         placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         placeholder.setStyleSheet(f"color: {MUTED}; font-size: 14px;")
@@ -126,6 +127,22 @@ class DetailPanelWidget(QWidget):
             item = self._layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+
+    def clear_event(self):
+        self._clear()
+        placeholder = QLabel("← 选择左侧卡顿事件\n查看完整诊断信息")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet(f"color: {MUTED}; font-size: 14px;")
+        self._layout.addWidget(placeholder)
+
+    def show_loading_event(self, event: LagEvent):
+        self._clear()
+        loading = QLabel(
+            f"正在加载卡顿详情…\n{event.started_at.strftime('%H:%M:%S')}  {event.cause_code or 'UNKNOWN'}"
+        )
+        loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading.setStyleSheet(f"color: {MUTED}; font-size: 13px;")
+        self._layout.addWidget(loading)
 
     def show_event(self, event: LagEvent, snapshot: LagSnapshot | None):
         self._clear()

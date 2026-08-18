@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
     cleanup_completed = Signal(int)
     probe_completed = Signal(str)
     frame_detector_reset_requested = Signal()
+    snapshot_loaded = Signal(object, object)
 
     def __init__(
         self,
@@ -188,6 +189,8 @@ class MainWindow(QMainWindow):
         self._probe_in_progress = False
         self._pending_frame_metrics: FrameMetricsSnapshot | None = None
         self._pending_compat_metrics: CompatibilityMetricsSnapshot | None = None
+        self._snapshot_cache: dict[int, LagSnapshot | None] = {}
+        self._selected_event_id: int | None = None
         self._last_metrics_ui_ts = 0.0
         self._last_statusbar_text = ""
         self._last_statusbar_ts = 0.0
@@ -347,6 +350,8 @@ class MainWindow(QMainWindow):
         self._engine.lag_ended.connect(self._on_lag_ended)
         self._engine.baseline_updated.connect(self._on_baseline_updated)
         self._event_log.event_selected.connect(self._on_event_selected)
+        self._event_log.event_delete_requested.connect(self._on_event_delete_requested)
+        self._event_log.clear_all_requested.connect(self._on_clear_all_events_requested)
         self._auto_checkbox.toggled.connect(self._on_auto_toggled)
         self._candidate_combo.currentIndexChanged.connect(self._on_candidate_selected)
         self._apply_target_btn.clicked.connect(self._apply_manual_target)
@@ -354,6 +359,7 @@ class MainWindow(QMainWindow):
         self._probe_btn.clicked.connect(self._probe_active_presents)
         self.cleanup_completed.connect(self._on_cleanup_completed)
         self.probe_completed.connect(self._on_probe_completed)
+        self.snapshot_loaded.connect(self._on_snapshot_loaded)
         if self._session_detector is not None:
             self._session_detector.session_changed.connect(self._on_session_changed)
             self._session_detector.candidates_changed.connect(self._on_candidates_changed)
@@ -460,6 +466,7 @@ class MainWindow(QMainWindow):
         event.id = event_id
         snapshot.event_id = event_id
         self._storage.save_snapshot(snapshot)
+        self._snapshot_cache[event_id] = snapshot
 
         # Update UI
         self._event_log.add_event(event)
@@ -494,8 +501,56 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_event_selected(self, event: LagEvent):
-        snapshot = self._storage.get_snapshot_for_event(event.id)
+        event_id = event.id
+        self._selected_event_id = event_id
+        if event_id and event_id in self._snapshot_cache:
+            self._detail_panel.show_event(event, self._snapshot_cache[event_id])
+            return
+        self._detail_panel.show_loading_event(event)
+
+        def _worker():
+            snapshot = self._storage.get_snapshot_for_event(event.id)
+            self.snapshot_loaded.emit(event, snapshot)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(object, object)
+    def _on_snapshot_loaded(self, event: LagEvent, snapshot: LagSnapshot | None):
+        event_id = event.id
+        if event_id:
+            self._snapshot_cache[event_id] = snapshot
+        if event_id != self._selected_event_id:
+            return
         self._detail_panel.show_event(event, snapshot)
+
+    @Slot(object)
+    def _on_event_delete_requested(self, event: LagEvent):
+        deleted = self._storage.delete_event(event.id)
+        if not deleted:
+            self._set_status_message("删除卡顿报告失败：记录不存在或已被删除", force=True)
+            return
+        if event.id:
+            self._snapshot_cache.pop(event.id, None)
+        if self._selected_event_id == event.id:
+            self._selected_event_id = None
+        self._event_log.remove_event(event)
+        self._detail_panel.clear_event()
+        count = self._storage.event_count()
+        self._event_count_label.setText(f"已记录 {count} 个事件")
+        self._set_status_message("已删除 1 条卡顿报告", force=True)
+
+    @Slot()
+    def _on_clear_all_events_requested(self):
+        removed = self._storage.delete_all_events()
+        if removed <= 0:
+            self._set_status_message("当前没有可清空的卡顿报告", force=True)
+            return
+        self._snapshot_cache.clear()
+        self._selected_event_id = None
+        self._event_log.clear_events()
+        self._detail_panel.clear_event()
+        self._event_count_label.setText("已记录 0 个事件")
+        self._set_status_message(f"已清空 {removed} 条卡顿报告", force=True)
 
     @Slot(bool)
     def _on_auto_toggled(self, enabled: bool):
@@ -753,6 +808,7 @@ class MainWindow(QMainWindow):
         snapshot = self._recorder.capture(event)
         snapshot.event_id = event_id
         self._storage.save_snapshot(snapshot)
+        self._snapshot_cache[event_id] = snapshot
 
         self._event_log.add_event(event)
         count = self._storage.event_count()

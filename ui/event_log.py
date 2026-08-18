@@ -58,6 +58,7 @@ class EventRow(QFrame):
     """Single clickable row in the event log."""
 
     clicked = Signal(object)   # emits LagEvent
+    delete_requested = Signal(object)  # emits LagEvent
 
     def __init__(self, event: LagEvent, parent=None):
         super().__init__(parent)
@@ -108,9 +109,31 @@ class EventRow(QFrame):
         """)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        delete_btn = QPushButton("×")
+        delete_btn.setFixedSize(22, 22)
+        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {MUTED};
+                background: transparent;
+                border: 1px solid #30363d;
+                border-radius: 11px;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 0;
+            }}
+            QPushButton:hover {{
+                color: {TEXT};
+                border-color: #58a6ff;
+                background: {BG3};
+            }}
+        """)
+        delete_btn.clicked.connect(self._on_delete_clicked)
+
         layout.addWidget(dot)
         layout.addLayout(info, stretch=1)
         layout.addWidget(badge)
+        layout.addWidget(delete_btn)
 
     def _set_style(self, selected: bool):
         bg = BG3 if selected else BG2
@@ -130,6 +153,9 @@ class EventRow(QFrame):
         self._selected = val
         self._set_style(val)
 
+    def _on_delete_clicked(self):
+        self.delete_requested.emit(self._lag_event)
+
     def mousePressEvent(self, event):
         self.clicked.emit(self._lag_event)
         super().mousePressEvent(event)
@@ -142,6 +168,8 @@ class EventLogWidget(QWidget):
     """
 
     event_selected = Signal(object)   # LagEvent
+    event_delete_requested = Signal(object)  # LagEvent
+    clear_all_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -167,9 +195,29 @@ class EventLogWidget(QWidget):
             font-size: 10px;
             font-weight: 700;
         """)
+        self._clear_all_btn = QPushButton("清空全部")
+        self._clear_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_all_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {MUTED};
+                background: transparent;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                color: {TEXT};
+                border-color: #58a6ff;
+                background: {BG3};
+            }}
+        """)
+        self._clear_all_btn.clicked.connect(self.clear_all_requested.emit)
         header.addWidget(title)
         header.addWidget(self._count_label)
         header.addStretch()
+        header.addWidget(self._clear_all_btn)
         layout.addLayout(header)
 
         # Scroll area
@@ -200,10 +248,30 @@ class EventLogWidget(QWidget):
 
         row = EventRow(event)
         row.clicked.connect(self._on_row_clicked)
+        row.delete_requested.connect(self.event_delete_requested.emit)
         self._rows.insert(0, row)
         self._list_layout.insertWidget(0, row)
+        self._refresh_state()
 
-        self._count_label.setText(str(len(self._rows)))
+    def remove_event(self, event: LagEvent) -> bool:
+        for row in list(self._rows):
+            if row._lag_event is event or row._lag_event.id == event.id:
+                if self._selected_row is row:
+                    self._selected_row = None
+                self._rows.remove(row)
+                row.setParent(None)
+                row.deleteLater()
+                self._refresh_state()
+                return True
+        return False
+
+    def clear_events(self):
+        for row in self._rows:
+            row.setParent(None)
+            row.deleteLater()
+        self._rows.clear()
+        self._selected_row = None
+        self._refresh_state()
 
     def _on_row_clicked(self, event: LagEvent):
         # Deselect previous
@@ -216,3 +284,9 @@ class EventLogWidget(QWidget):
                 self._selected_row = row
                 break
         self.event_selected.emit(event)
+
+    def _refresh_state(self):
+        count = len(self._rows)
+        self._count_label.setText(str(count))
+        self._empty_label.setVisible(count == 0)
+        self._clear_all_btn.setEnabled(count > 0)
