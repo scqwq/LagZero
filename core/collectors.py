@@ -14,6 +14,9 @@ from PySide6.QtCore import QThread, Signal
 from core.models import SystemSample, ProcessSample
 
 
+PROCESS_REFRESH_INTERVAL = 3
+
+
 # ---------------------------------------------------------------------------
 # Responsiveness probe
 # ---------------------------------------------------------------------------
@@ -58,18 +61,13 @@ class SystemCollector(QThread):
         self.interval = interval
         self.top_n = top_n_processes
         self._running = False
-
-        # Prime psutil CPU counters so first call isn't 0.0
-        psutil.cpu_percent(interval=None)
-        for proc in psutil.process_iter():
-            try:
-                proc.cpu_percent(interval=None)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+        self._collect_count = 0
+        self._last_top_processes: list[ProcessSample] = []
 
     # ------------------------------------------------------------------
     def run(self):
         self._running = True
+        self._prime_counters()
         while self._running:
             loop_start = time.perf_counter()
             try:
@@ -88,8 +86,18 @@ class SystemCollector(QThread):
         self._running = False
         self.wait(2000)
 
+    def _prime_counters(self):
+        # Prime psutil CPU counters in the worker thread so startup UI is not blocked.
+        psutil.cpu_percent(interval=None)
+        for proc in psutil.process_iter():
+            try:
+                proc.cpu_percent(interval=None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
     # ------------------------------------------------------------------
     def _collect(self) -> SystemSample:
+        self._collect_count += 1
         now = datetime.now()
 
         # --- CPU ---
@@ -104,7 +112,12 @@ class SystemCollector(QThread):
         responsiveness = measure_responsiveness_ms()
 
         # --- Top processes ---
-        processes = self._top_processes()
+        if (
+            not self._last_top_processes
+            or (self._collect_count % PROCESS_REFRESH_INTERVAL) == 1
+        ):
+            self._last_top_processes = self._top_processes()
+        processes = self._last_top_processes
 
         return SystemSample(
             timestamp=now,

@@ -175,6 +175,9 @@ class CompatibilitySample:
     process_read_kb_s: float
     process_write_kb_s: float
     thread_count: int
+    visual_hash: int = 0
+    visual_change_ratio: float = 0.0
+    visual_frozen_streak: int = 0
 
 
 @dataclass
@@ -189,3 +192,6 @@ class CompatibilityMetricsSnapshot:
     process_write_kb_s: float
     thread_count: int
     is_hung: bool
+    visual_hash: int = 0
+    visual_change_ratio: float = 0.0
+    visual_frozen_streak: int = 0

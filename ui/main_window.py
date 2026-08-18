@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
         self._window_candidates: list[GameWindowCandidate] = []
         self._window_candidates_key: tuple[tuple[int, int, str, int, int], ...] | None = None
         self._deferred_candidates: list[GameWindowCandidate] | None = None
-        self._auto_attach = False
+        self._auto_attach = True
         self._last_system_sample: SystemSample | None = None
         self._allow_exit = False
         self._button_feedback_timers: dict[QPushButton, QTimer] = {}
@@ -201,6 +201,7 @@ class MainWindow(QMainWindow):
         self._last_compat_diag_ts = 0.0
         self._last_capture_diag_text = ""
         self._last_capture_diag_ts = 0.0
+        self._manual_candidate_hold_until = 0.0
 
         self.setWindowTitle("LagLense")
         self.resize(1100, 720)
@@ -212,7 +213,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._load_history)
         self._metrics_timer = QTimer(self)
         self._metrics_timer.timeout.connect(self._flush_frame_metrics)
-        self._metrics_timer.start(500)
+        self._metrics_timer.start(250)
         self._candidate_debounce_timer = QTimer(self)
         self._candidate_debounce_timer.setSingleShot(True)
         self._candidate_debounce_timer.timeout.connect(self._apply_deferred_candidates)
@@ -255,11 +256,11 @@ class MainWindow(QMainWindow):
         self._window_label.setStyleSheet(f"color: {TEXT}; font-size: 12px;")
         self._capture_mode_label = QLabel("采集模式：高精度")
         self._capture_mode_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px; font-weight: 700;")
-        self._pm_status_label = QLabel("PresentMon：未启动（请手动应用目标）")
+        self._pm_status_label = QLabel("PresentMon：空闲")
         self._pm_status_label.setStyleSheet(f"color: {TEXT}; font-size: 12px;")
         self._capture_identity_label = QLabel("采集目标：未设置")
         self._capture_identity_label.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
-        self._capture_diag_label = QLabel("诊断：当前为手动模式。先从下拉框选择窗口，或输入 .exe 名称后点击“应用目标”。")
+        self._capture_diag_label = QLabel("诊断：等待采集启动")
         self._capture_diag_label.setWordWrap(True)
         self._capture_diag_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         self._probe_result_label = QLabel("探测：尚未运行")
@@ -276,11 +277,11 @@ class MainWindow(QMainWindow):
         control_row = QHBoxLayout()
         control_row.setSpacing(8)
         self._auto_checkbox = QCheckBox("自动附着前台游戏")
-        self._auto_checkbox.setChecked(False)
+        self._auto_checkbox.setChecked(True)
         self._candidate_combo = QComboBox()
         self._candidate_combo.setMinimumWidth(260)
         self._candidate_combo.addItem("没有候选窗口")
-        self._candidate_combo.setEnabled(True)
+        self._candidate_combo.setEnabled(False)
         self._target_input = QLineEdit()
         self._target_input.setPlaceholderText("例如：java.exe / cs2.exe")
         self._apply_target_btn = QPushButton("应用目标")
@@ -500,27 +501,15 @@ class MainWindow(QMainWindow):
     def _on_auto_toggled(self, enabled: bool):
         self._auto_attach = enabled
         self._candidate_combo.setEnabled(not enabled)
-        if self._presentmon is None:
-            return
-        if enabled:
-            self._set_pm_status_text("PresentMon：等待前台游戏", force=True)
-            self._capture_diag_label.setText("诊断：自动模式已开启。检测到前台游戏后会自动附着。")
+        if enabled and self._presentmon is not None:
+            self._pm_status_label.setText("PresentMon：等待前台游戏")
             self._presentmon.stop_capture()
-            if self._compat_capture is not None:
-                self._compat_capture.stop_capture()
-            return
-        self._presentmon.stop_capture()
-        if self._compat_capture is not None:
-            self._compat_capture.stop_capture()
-        self._set_pm_status_text("PresentMon：未启动（请手动应用目标）", force=True)
-        self._capture_diag_label.setText(
-            "诊断：当前为手动模式。先从下拉框选择窗口，或输入 .exe 名称后点击“应用目标”。"
-        )
 
     @Slot(int)
     def _on_candidate_selected(self, index: int):
         if self._auto_attach or index < 0 or index >= len(self._window_candidates):
             return
+        self._manual_candidate_hold_until = monotonic() + 2.0
         self._target_input.setText(self._window_candidates[index].process_name)
 
     @Slot()
@@ -536,6 +525,7 @@ class MainWindow(QMainWindow):
         if self._frame_detector is not None:
             self.frame_detector_reset_requested.emit()
         target, pid = self._resolve_capture_target(target)
+        self._manual_candidate_hold_until = monotonic() + 3.0
         self._target_input.setText(target)
         self._presentmon.set_target(target, pid=pid)
         if self._compat_capture is not None:
@@ -607,7 +597,12 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_candidates_changed(self, candidates: list[GameWindowCandidate]):
-        if not self._auto_attach and (self._candidate_combo.hasFocus() or self._candidate_combo.view().isVisible()):
+        now = monotonic()
+        if not self._auto_attach and (
+            self._candidate_combo.hasFocus()
+            or self._candidate_combo.view().isVisible()
+            or now < self._manual_candidate_hold_until
+        ):
             self._deferred_candidates = candidates
             self._candidate_debounce_timer.start(600)
             return
@@ -649,7 +644,12 @@ class MainWindow(QMainWindow):
     def _apply_deferred_candidates(self):
         if self._deferred_candidates is None:
             return
-        if not self._auto_attach and (self._candidate_combo.hasFocus() or self._candidate_combo.view().isVisible()):
+        now = monotonic()
+        if not self._auto_attach and (
+            self._candidate_combo.hasFocus()
+            or self._candidate_combo.view().isVisible()
+            or now < self._manual_candidate_hold_until
+        ):
             self._candidate_debounce_timer.start(600)
             return
         candidates = self._deferred_candidates
@@ -682,6 +682,9 @@ class MainWindow(QMainWindow):
         else:
             self._compat_recovery_count = 0
         self._pending_frame_metrics = metrics
+        now = monotonic()
+        if (now - self._last_metrics_ui_ts) >= 0.25:
+            self._flush_frame_metrics()
 
     @Slot(str)
     def _on_compat_status(self, message: str):
@@ -695,16 +698,18 @@ class MainWindow(QMainWindow):
             return
         self._last_compat_debug = (
             f"compat_debug=response_ms={metrics.response_time_ms:.1f} | hung={metrics.is_hung} | "
+            f"visual={'steady' if metrics.visual_change_ratio == 0.0 else 'changed'} | "
+            f"frozen_streak={metrics.visual_frozen_streak} | "
             f"cpu={metrics.process_cpu_percent:.1f}% | mem={metrics.process_memory_mb:.0f}MB | "
             f"io={(metrics.process_read_kb_s + metrics.process_write_kb_s):.0f}KB/s | threads={metrics.thread_count}"
         )
         diag_text = "诊断：兼容模式运行中\n" + self._last_compat_debug
-        now = monotonic()
-        if diag_text != self._last_compat_diag_text or (now - self._last_compat_diag_ts) >= 1.0:
-            self._last_compat_diag_text = diag_text
-            self._last_compat_diag_ts = now
-            self._capture_diag_label.setText(diag_text)
+        self._last_compat_diag_text = diag_text
+        self._set_capture_diag_text(diag_text, min_interval=0.35)
         self._pending_compat_metrics = metrics
+        now = monotonic()
+        if (now - self._last_metrics_ui_ts) >= 0.25:
+            self._flush_frame_metrics()
 
     @Slot(str)
     def _on_capture_mode_changed(self, mode: str):
@@ -725,15 +730,7 @@ class MainWindow(QMainWindow):
     def _on_capture_diagnostics_changed(self, diagnostics: str):
         if self._compat_active:
             return
-        text = f"诊断：{diagnostics}"
-        now = monotonic()
-        if text == self._last_capture_diag_text and (now - self._last_capture_diag_ts) < 1.0:
-            return
-        if (now - self._last_capture_diag_ts) < 0.75:
-            return
-        self._last_capture_diag_text = text
-        self._last_capture_diag_ts = now
-        self._capture_diag_label.setText(text)
+        self._set_capture_diag_text(f"诊断：{diagnostics}", min_interval=0.75)
 
     @Slot(object)
     def _on_frame_stutter_started(self, started_at: datetime):
@@ -832,9 +829,18 @@ class MainWindow(QMainWindow):
         self._last_pm_status_ts = now
         self._pm_status_label.setText(value)
 
-    # ------------------------------------------------------------------
-    # Tray
-    # ------------------------------------------------------------------
+    def _set_capture_diag_text(self, text: str, *, force: bool = False, min_interval: float = 0.75):
+        value = (text or "").strip()
+        if not value:
+            return
+        now = monotonic()
+        if not force and value == self._last_capture_diag_text and (now - self._last_capture_diag_ts) < 1.0:
+            return
+        if not force and (now - self._last_capture_diag_ts) < min_interval:
+            return
+        self._last_capture_diag_text = value
+        self._last_capture_diag_ts = now
+        self._capture_diag_label.setText(value)
 
     def _setup_tray(self):
         self._tray = QSystemTrayIcon(self)
@@ -922,7 +928,7 @@ class MainWindow(QMainWindow):
         self._set_capture_chip_labels("模式", "响应延迟", "进程 CPU", "IO / 未响应")
         self._last_compat_diag_text = f"诊断：由于高精度采集不可用，已自动切换到兼容模式。\n最近原因：{reason}"
         self._last_compat_diag_ts = monotonic()
-        self._capture_diag_label.setText(self._last_compat_diag_text)
+        self._set_capture_diag_text(self._last_compat_diag_text, force=True)
         self._set_pm_status_text("兼容模式：正在运行", force=True)
         self._status_dot.set_warning()
         self._compat_capture.start_capture()

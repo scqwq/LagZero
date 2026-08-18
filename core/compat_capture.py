@@ -24,6 +24,7 @@ COLORREF = getattr(wintypes, "COLORREF", wintypes.DWORD)
 WM_NULL = 0x0000
 SMTO_ABORTIFHUNG = 0x0002
 RESPONSIVENESS_TIMEOUT_MS = 250
+STATUS_EMIT_INTERVAL_S = 1.0
 
 
 class RECT(ctypes.Structure):
@@ -37,6 +38,8 @@ class RECT(ctypes.Structure):
 
 user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
 user32.EnumWindows.restype = wintypes.BOOL
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.IsWindowVisible.restype = wintypes.BOOL
 user32.GetForegroundWindow.restype = wintypes.HWND
@@ -60,6 +63,14 @@ user32.SendMessageTimeoutW.argtypes = [
 user32.SendMessageTimeoutW.restype = wintypes.LPARAM
 user32.IsHungAppWindow.argtypes = [wintypes.HWND]
 user32.IsHungAppWindow.restype = wintypes.BOOL
+user32.GetWindowDC.argtypes = [wintypes.HWND]
+user32.GetWindowDC.restype = wintypes.HDC
+user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+user32.ReleaseDC.restype = ctypes.c_int
+
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+gdi32.GetPixel.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.GetPixel.restype = COLORREF
 
 
 def _window_title(hwnd: int) -> str:
@@ -122,7 +133,7 @@ class CompatibilityCapture(QThread):
     error_occurred = Signal(str)
     mode_changed = Signal(str)
 
-    def __init__(self, interval_ms: int = 500, parent=None):
+    def __init__(self, interval_ms: int = 250, parent=None):
         super().__init__(parent)
         self.interval_ms = interval_ms
         self._running = False
@@ -131,11 +142,22 @@ class CompatibilityCapture(QThread):
         self._target_pid: int | None = None
         self._last_io: tuple[int, int, float] | None = None
         self._last_status_text = ""
+        self._last_status_emit_ts = 0.0
+        self._last_visual_hash = 0
+        self._visual_frozen_streak = 0
+        self._cached_hwnd = 0
+        self._cached_title = ""
+        self._cached_hwnd_pid: int | None = None
 
     def set_target(self, process_name: str = "", pid: int | None = None):
         self._target_process = (process_name or "").strip()
         self._target_pid = pid if pid and pid > 0 else None
         self._last_io = None
+        self._last_visual_hash = 0
+        self._visual_frozen_streak = 0
+        self._cached_hwnd = 0
+        self._cached_title = ""
+        self._cached_hwnd_pid = None
 
     def start_capture(self):
         if not self.isRunning():
@@ -143,11 +165,11 @@ class CompatibilityCapture(QThread):
             self.start()
         self._active = True
         self.mode_changed.emit("Compatibility")
-        self._emit_status(f"Compatibility capture active for {self.target_description()}")
+        self._emit_status(f"Compatibility capture active for {self.target_description()}", force=True)
 
     def stop_capture(self):
         self._active = False
-        self._emit_status("Compatibility capture idle")
+        self._emit_status("Compatibility capture idle", force=True)
 
     def shutdown(self):
         self._active = False
@@ -174,14 +196,27 @@ class CompatibilityCapture(QThread):
     def _capture_sample(self) -> CompatibilitySample | None:
         process = self._resolve_process()
         if process is None:
+            self._cached_hwnd = 0
+            self._cached_title = ""
+            self._cached_hwnd_pid = None
             self._emit_status(f"Compatibility mode waiting for {self.target_description()}")
             return None
 
-        hwnd, title = _find_window_for_target(process.pid, process.name())
+        hwnd, title = self._resolve_window_handle(process)
         foreground_hwnd = int(user32.GetForegroundWindow() or 0)
         is_foreground = bool(hwnd and hwnd == foreground_hwnd)
         is_hung = bool(hwnd and user32.IsHungAppWindow(hwnd))
         response_time_ms = self._measure_response_ms(hwnd)
+        visual_hash = self._sample_visual_hash(hwnd)
+        visual_change_ratio = 0.0
+        if visual_hash and self._last_visual_hash:
+            visual_change_ratio = 0.0 if visual_hash == self._last_visual_hash else 1.0
+        if visual_hash and visual_hash == self._last_visual_hash:
+            self._visual_frozen_streak += 1
+        else:
+            self._visual_frozen_streak = 0
+        if visual_hash:
+            self._last_visual_hash = visual_hash
 
         try:
             cpu_percent = process.cpu_percent(interval=None)
@@ -202,7 +237,7 @@ class CompatibilityCapture(QThread):
             write_kb_s = max(0.0, (current_io[1] - prev_write) / 1024.0 / elapsed)
         self._last_io = current_io
         self._emit_status(
-            f"Compatibility capture monitoring {process.name()} | response {response_time_ms:.1f} ms"
+            f"Compatibility capture monitoring {process.name()}"
         )
 
         return CompatibilitySample(
@@ -219,6 +254,9 @@ class CompatibilityCapture(QThread):
             process_read_kb_s=read_kb_s,
             process_write_kb_s=write_kb_s,
             thread_count=threads,
+            visual_hash=visual_hash,
+            visual_change_ratio=visual_change_ratio,
+            visual_frozen_streak=self._visual_frozen_streak,
         )
 
     def _resolve_process(self) -> psutil.Process | None:
@@ -239,6 +277,23 @@ class CompatibilityCapture(QThread):
                 continue
         return None
 
+    def _resolve_window_handle(self, process: psutil.Process) -> tuple[int, str]:
+        cached_hwnd = self._cached_hwnd
+        if cached_hwnd and self._cached_hwnd_pid == process.pid:
+            if user32.IsWindow(cached_hwnd) and user32.IsWindowVisible(cached_hwnd):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(cached_hwnd, ctypes.byref(pid))
+                if pid.value == process.pid:
+                    title = _window_title(cached_hwnd)
+                    if title:
+                        self._cached_title = title
+                        return cached_hwnd, title
+        hwnd, title = _find_window_for_target(process.pid, process.name())
+        self._cached_hwnd = hwnd
+        self._cached_title = title
+        self._cached_hwnd_pid = process.pid if hwnd else None
+        return hwnd, title
+
     def _measure_response_ms(self, hwnd: int) -> float:
         if not hwnd:
             return 0.0
@@ -258,6 +313,41 @@ class CompatibilityCapture(QThread):
             return float(RESPONSIVENESS_TIMEOUT_MS)
         return elapsed_ms
 
+    def _sample_visual_hash(self, hwnd: int) -> int:
+        if not hwnd:
+            return 0
+        rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return 0
+        width = max(0, rect.right - rect.left)
+        height = max(0, rect.bottom - rect.top)
+        if width < 4 or height < 4:
+            return 0
+        hdc = user32.GetWindowDC(hwnd)
+        if not hdc:
+            return 0
+        try:
+            points = (
+                (width // 6, height // 6),
+                (width // 2, height // 6),
+                (width * 5 // 6, height // 6),
+                (width // 6, height // 2),
+                (width // 2, height // 2),
+                (width * 5 // 6, height // 2),
+                (width // 6, height * 5 // 6),
+                (width // 2, height * 5 // 6),
+                (width * 5 // 6, height * 5 // 6),
+            )
+            value = 1469598103934665603
+            for x, y in points:
+                pixel = int(gdi32.GetPixel(hdc, x, y))
+                value ^= pixel & 0xFFFFFFFF
+                value *= 1099511628211
+                value &= 0xFFFFFFFFFFFFFFFF
+            return int(value)
+        finally:
+            user32.ReleaseDC(hwnd, hdc)
+
     @staticmethod
     def _build_metrics(sample: CompatibilitySample) -> CompatibilityMetricsSnapshot:
         return CompatibilityMetricsSnapshot(
@@ -271,10 +361,17 @@ class CompatibilityCapture(QThread):
             process_write_kb_s=sample.process_write_kb_s,
             thread_count=sample.thread_count,
             is_hung=sample.is_hung,
+            visual_hash=sample.visual_hash,
+            visual_change_ratio=sample.visual_change_ratio,
+            visual_frozen_streak=sample.visual_frozen_streak,
         )
 
-    def _emit_status(self, message: str):
-        if message == self._last_status_text:
+    def _emit_status(self, message: str, force: bool = False):
+        now = monotonic()
+        if not force and message == self._last_status_text:
+            return
+        if not force and (now - self._last_status_emit_ts) < STATUS_EMIT_INTERVAL_S:
             return
         self._last_status_text = message
+        self._last_status_emit_ts = now
         self.status_changed.emit(message)

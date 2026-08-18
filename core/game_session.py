@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from time import monotonic
 
 import psutil
 from PySide6.QtCore import QThread, Signal
@@ -42,6 +43,8 @@ BLACKLISTED_PROCESSES = {
 
 MIN_WINDOW_WIDTH = 640
 MIN_WINDOW_HEIGHT = 360
+PROCESS_NAME_CACHE_TTL_S = 3.0
+_PROCESS_NAME_CACHE: dict[int, tuple[str, float]] = {}
 
 
 class RECT(ctypes.Structure):
@@ -85,10 +88,16 @@ def _window_rect(hwnd: int) -> tuple[int, int]:
 
 
 def _process_name(pid: int) -> str:
+    now = monotonic()
+    cached = _PROCESS_NAME_CACHE.get(pid)
+    if cached and (now - cached[1]) < PROCESS_NAME_CACHE_TTL_S:
+        return cached[0]
     try:
-        return psutil.Process(pid).name()
+        name = psutil.Process(pid).name()
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         return ""
+    _PROCESS_NAME_CACHE[pid] = (name, now)
+    return name
 
 
 def _candidate_from_hwnd(hwnd: int, foreground_hwnd: int | None = None) -> GameWindowCandidate | None:

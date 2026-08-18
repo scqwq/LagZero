@@ -17,6 +17,7 @@ from core.models import CompatibilitySample, FrameStutterEpisode
 RESPONSE_SPIKE_MS = 120.0
 RESPONSE_FREEZE_MS = 250.0
 CALM_TIME_TO_END_MS = 900.0
+VISUAL_FROZEN_STREAK_LIMIT = 8
 
 
 class CompatibilityStutterDetector(QObject):
@@ -92,6 +93,8 @@ class CompatibilityStutterDetector(QObject):
     def _is_stutter(self, sample: CompatibilitySample) -> tuple[bool, str]:
         if sample.is_hung or sample.response_time_ms >= RESPONSE_FREEZE_MS:
             return True, "COMPAT_WINDOW_HANG"
+        if sample.visual_frozen_streak >= VISUAL_FROZEN_STREAK_LIMIT and sample.response_time_ms >= 40.0:
+            return True, "COMPAT_VISUAL_FREEZE"
         if sample.response_time_ms >= RESPONSE_SPIKE_MS:
             return True, "COMPAT_STALL"
         if sample.process_cpu_percent >= 85.0 and sample.response_time_ms >= 60.0:

@@ -41,7 +41,7 @@ def main():
     app.setQuitOnLastWindowClosed(False)  # Keep running in tray
 
     # --- Instantiate core components ---
-    collector = SystemCollector(interval=1.0, top_n_processes=10)
+    collector = SystemCollector(interval=1.0, top_n_processes=8)
     engine    = DetectionEngine()
     recorder  = SnapshotRecorder(pre_lag_seconds=5)
     analyzer  = CauseAnalyzer()
@@ -53,7 +53,7 @@ def main():
     frame_detector.moveToThread(frame_detector_thread)
     frame_detector_thread.start()
     presentmon.connect_frame_consumer(frame_detector.ingest_frame)
-    compat_capture = CompatibilityCapture(interval_ms=500)
+    compat_capture = CompatibilityCapture(interval_ms=400)
     compat_detector = CompatibilityStutterDetector()
     compat_detector_thread = QThread()
     compat_detector.moveToThread(compat_detector_thread)
