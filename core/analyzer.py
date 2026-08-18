@@ -14,6 +14,18 @@ register it in RULE_PRIORITY.  The engine tries them in order.
 """
 from core.models import SystemSample, ProcessSample
 
+CATEGORY_CPU_BOUND = "CPU_BOUND"
+CATEGORY_GPU_BOUND = "GPU_BOUND"
+CATEGORY_RAM_PRESSURE = "RAM_PRESSURE"
+CATEGORY_IO_STALL = "IO_STALL"
+CATEGORY_BACKGROUND_INTERFERENCE = "BACKGROUND_INTERFERENCE"
+CATEGORY_LOCAL_STUTTER = "LOCAL_STUTTER"
+CATEGORY_UNDETERMINED = "UNDETERMINED"
+
+SCOPE_LOCAL = "LOCAL"
+SCOPE_NETWORK = "NETWORK"
+SCOPE_UNDETERMINED = "UNDETERMINED"
+
 # Thresholds used by rules
 SINGLE_PROC_CPU_THRESHOLD = 40.0    # % — a single process eating this much is suspicious
 RAM_EXHAUSTION_THRESHOLD = 88.0     # % RAM used
@@ -25,7 +37,7 @@ RESP_HIGH_THRESHOLD_MS = 40.0       # ms — above this is "high responsiveness 
 
 class CauseAnalyzer:
 
-    def analyze(self, peak_sample: SystemSample, pre_lag_samples: list[SystemSample]) -> tuple[str, str]:
+    def analyze(self, peak_sample: SystemSample, pre_lag_samples: list[SystemSample]) -> tuple[str, str, str]:
         """
         Returns (cause_code, human_readable_explanation).
 
@@ -36,8 +48,10 @@ class CauseAnalyzer:
             result = rule_fn(peak_sample, pre_lag_samples)
             if result:
                 return result
-
-        return "UNKNOWN", "No clear cause identified. System may be under general stress."
+        return CATEGORY_UNDETERMINED, (
+            "No clear local bottleneck was identified. The stutter is real, but the current data is not enough "
+            "to confidently separate CPU, RAM, disk, background load, or a possible network-side issue."
+        ), SCOPE_UNDETERMINED
 
     # ------------------------------------------------------------------
     # Rules (tried in order — first match wins)
@@ -54,7 +68,7 @@ class CauseAnalyzer:
 
     def _rule_single_cpu_spike(
         self, sample: SystemSample, _pre: list[SystemSample]
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         """One process is hogging the CPU."""
         if not sample.top_processes:
             return None
@@ -62,57 +76,61 @@ class CauseAnalyzer:
         if top.cpu_percent >= SINGLE_PROC_CPU_THRESHOLD:
             pct = round(top.cpu_percent, 1)
             return (
-                "CPU_SPIKE",
+                CATEGORY_CPU_BOUND,
                 f'"{top.name}" (PID {top.pid}) was consuming {pct}% CPU, '
                 f"causing the system to become unresponsive. "
                 f"Try closing or restarting this application.",
+                SCOPE_LOCAL,
             )
         return None
 
     def _rule_ram_exhaustion(
         self, sample: SystemSample, _pre: list[SystemSample]
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         """RAM is nearly full and the OS is paging to disk."""
         if sample.ram_percent >= RAM_EXHAUSTION_THRESHOLD and sample.swap_percent >= SWAP_ACTIVE_THRESHOLD:
             used_gb = round(sample.ram_used_mb / 1024, 1)
             total_gb = round(sample.ram_total_mb / 1024, 1)
             swap = round(sample.swap_percent, 1)
             return (
-                "RAM_EXHAUSTION",
+                CATEGORY_RAM_PRESSURE,
                 f"System RAM is critically full ({used_gb} GB / {total_gb} GB used, "
                 f"{swap}% swap active). The OS is writing memory to disk (paging), "
                 f"which is much slower than RAM. Close unused applications or browser tabs.",
+                SCOPE_LOCAL,
             )
         if sample.ram_percent >= RAM_EXHAUSTION_THRESHOLD:
             used_gb = round(sample.ram_used_mb / 1024, 1)
             total_gb = round(sample.ram_total_mb / 1024, 1)
             return (
-                "RAM_PRESSURE",
+                CATEGORY_RAM_PRESSURE,
                 f"RAM usage is very high ({used_gb} GB / {total_gb} GB). "
                 f"The system is running out of memory headroom. "
                 f"Close unused applications to free memory.",
+                SCOPE_LOCAL,
             )
         return None
 
     def _rule_background_cluster(
         self, sample: SystemSample, _pre: list[SystemSample]
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         """Many small background processes adding up to a lot of CPU."""
         contributors = [p for p in sample.top_processes if p.cpu_percent >= 5.0]
         if len(contributors) >= BACKGROUND_CLUSTER_COUNT:
             names = ", ".join(f'"{p.name}"' for p in contributors[:5])
             total = round(sum(p.cpu_percent for p in contributors), 1)
             return (
-                "BACKGROUND_CLUSTER",
+                CATEGORY_BACKGROUND_INTERFERENCE,
                 f"{len(contributors)} background processes ({names}) are each consuming CPU, "
                 f"totalling ~{total}% combined. No single villain, but the crowd is the problem. "
                 f"Consider disabling startup applications.",
+                SCOPE_LOCAL,
             )
         return None
 
     def _rule_disk_io(
         self, sample: SystemSample, _pre: list[SystemSample]
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         """High responsiveness delay but CPU is normal → likely disk I/O bottleneck."""
         if (
             sample.responsiveness_ms >= RESP_HIGH_THRESHOLD_MS
@@ -120,25 +138,27 @@ class CauseAnalyzer:
         ):
             resp = round(sample.responsiveness_ms, 1)
             return (
-                "DISK_IO",
+                CATEGORY_IO_STALL,
                 f"CPU usage was normal ({round(sample.cpu_percent, 1)}%) but system responsiveness "
                 f"was severely degraded ({resp} ms delay). This typically means a disk I/O bottleneck — "
                 f"something is reading/writing heavily to storage (antivirus scan, updates, backup, "
                 f"or a failing drive).",
+                SCOPE_LOCAL,
             )
         return None
 
     def _rule_scheduler_contention(
         self, sample: SystemSample, _pre: list[SystemSample]
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         """Fallback — general system stress, no single root cause."""
         resp = round(sample.responsiveness_ms, 1)
         cpu = round(sample.cpu_percent, 1)
         return (
-            "SCHEDULER_CONTENTION",
+            CATEGORY_LOCAL_STUTTER,
             f"System was under general stress (CPU: {cpu}%, responsiveness: {resp} ms) "
             f"but no single clear cause was identified. This may be OS scheduler contention — "
             f"many processes competing for CPU time simultaneously.",
+            SCOPE_LOCAL,
         )
 
     # ------------------------------------------------------------------

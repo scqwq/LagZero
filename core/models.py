@@ -50,8 +50,11 @@ class LagEvent:
     peak_composite_score: float
     cause: str                  # human-readable explanation
     cause_code: str             # machine tag: CPU_SPIKE, RAM_EXHAUSTION, etc.
+    category: str = ""
+    scope: str = ""
     duration_seconds: float = 0.0
     snapshot_id: Optional[int] = None
+    is_pending: bool = False
 
 
 @dataclass
@@ -158,6 +161,8 @@ class FrameStutterEpisode:
     present_mode: str
     severity: float
     explanation: str
+    category: str = ""
+    scope: str = ""
 
 
 @dataclass

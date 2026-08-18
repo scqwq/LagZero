@@ -148,6 +148,8 @@ class CompatibilityCapture(QThread):
         self._cached_hwnd = 0
         self._cached_title = ""
         self._cached_hwnd_pid: int | None = None
+        self._cached_process: psutil.Process | None = None
+        self._cached_process_pid: int | None = None
 
     def set_target(self, process_name: str = "", pid: int | None = None):
         self._target_process = (process_name or "").strip()
@@ -158,6 +160,8 @@ class CompatibilityCapture(QThread):
         self._cached_hwnd = 0
         self._cached_title = ""
         self._cached_hwnd_pid = None
+        self._cached_process = None
+        self._cached_process_pid = None
 
     def start_capture(self):
         if not self.isRunning():
@@ -260,9 +264,18 @@ class CompatibilityCapture(QThread):
         )
 
     def _resolve_process(self) -> psutil.Process | None:
+        if self._cached_process is not None and self._cached_process_pid:
+            try:
+                if self._cached_process.is_running() and self._cached_process.pid == self._cached_process_pid:
+                    return self._cached_process
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                self._cached_process = None
+                self._cached_process_pid = None
         if self._target_pid:
             try:
-                return psutil.Process(self._target_pid)
+                process = psutil.Process(self._target_pid)
+                self._prime_process_cpu(process)
+                return process
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 return None
         target_name = self._target_process.lower()
@@ -272,10 +285,21 @@ class CompatibilityCapture(QThread):
             try:
                 if (process.info.get("name") or "").lower() == target_name:
                     self._target_pid = process.pid
-                    return psutil.Process(process.pid)
+                    resolved = psutil.Process(process.pid)
+                    self._prime_process_cpu(resolved)
+                    return resolved
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
         return None
+
+    def _prime_process_cpu(self, process: psutil.Process):
+        self._cached_process = process
+        self._cached_process_pid = process.pid
+        try:
+            process.cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            self._cached_process = None
+            self._cached_process_pid = None
 
     def _resolve_window_handle(self, process: psutil.Process) -> tuple[int, str]:
         cached_hwnd = self._cached_hwnd

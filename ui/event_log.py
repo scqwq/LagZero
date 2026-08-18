@@ -34,6 +34,13 @@ CAUSE_COLOURS = {
     "BACKGROUND_CLUSTER":   AMBER,
     "DISK_IO":              "#1abc9c",
     "SCHEDULER_CONTENTION": MUTED,
+    "CPU_BOUND":            RED,
+    "GPU_BOUND":            ACCENT,
+    "IO_STALL":             "#1abc9c",
+    "BACKGROUND_INTERFERENCE": AMBER,
+    "LOCAL_STUTTER":        AMBER,
+    "UNDETERMINED":         MUTED,
+    "REPORT_PENDING":       ACCENT,
     "FRAME_SPIKE":          ACCENT,
     "FRAME_STUTTER":        "#e67e22",
     "FRAME_FREEZE":         RED,
@@ -74,40 +81,23 @@ class EventRow(QFrame):
         layout.setSpacing(10)
 
         # Colour dot
-        dot = QLabel("●")
-        dot.setFixedWidth(14)
-        colour = _severity_colour(self._lag_event.peak_composite_score)
-        dot.setStyleSheet(f"color: {colour}; font-size: 10px;")
+        self._dot = QLabel("●")
+        self._dot.setFixedWidth(14)
 
         # Time + duration
-        time_str = self._lag_event.started_at.strftime("%H:%M:%S")
-        date_str = self._lag_event.started_at.strftime("%b %d")
-        dur = round(self._lag_event.duration_seconds, 1)
-
         info = QVBoxLayout()
         info.setSpacing(2)
-        time_label = QLabel(f"{time_str}  <span style='color:{MUTED};font-size:10px'>{date_str}</span>")
-        time_label.setTextFormat(Qt.TextFormat.RichText)
-        time_label.setStyleSheet(f"color: {TEXT}; font-size: 12px; font-weight: 600;")
-        dur_label = QLabel(f"{dur}s duration")
-        dur_label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
-        info.addWidget(time_label)
-        info.addWidget(dur_label)
+        self._time_label = QLabel()
+        self._time_label.setTextFormat(Qt.TextFormat.RichText)
+        self._time_label.setStyleSheet(f"color: {TEXT}; font-size: 12px; font-weight: 600;")
+        self._dur_label = QLabel()
+        self._dur_label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        info.addWidget(self._time_label)
+        info.addWidget(self._dur_label)
 
         # Cause badge
-        code = self._lag_event.cause_code or "UNKNOWN"
-        badge_colour = CAUSE_COLOURS.get(code, MUTED)
-        badge = QLabel(code.replace("_", " "))
-        badge.setStyleSheet(f"""
-            color: {badge_colour};
-            background: transparent;
-            border: 1px solid {badge_colour};
-            border-radius: 4px;
-            padding: 1px 6px;
-            font-size: 9px;
-            font-weight: 700;
-        """)
-        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._badge = QLabel()
+        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         delete_btn = QPushButton("×")
         delete_btn.setFixedSize(22, 22)
@@ -130,10 +120,11 @@ class EventRow(QFrame):
         """)
         delete_btn.clicked.connect(self._on_delete_clicked)
 
-        layout.addWidget(dot)
+        layout.addWidget(self._dot)
         layout.addLayout(info, stretch=1)
-        layout.addWidget(badge)
+        layout.addWidget(self._badge)
         layout.addWidget(delete_btn)
+        self.refresh()
 
     def _set_style(self, selected: bool):
         bg = BG3 if selected else BG2
@@ -152,6 +143,30 @@ class EventRow(QFrame):
     def set_selected(self, val: bool):
         self._selected = val
         self._set_style(val)
+
+    def refresh(self):
+        time_str = self._lag_event.started_at.strftime("%H:%M:%S")
+        date_str = self._lag_event.started_at.strftime("%b %d")
+        dur = round(self._lag_event.duration_seconds, 1)
+        self._time_label.setText(f"{time_str}  <span style='color:{MUTED};font-size:10px'>{date_str}</span>")
+        if self._lag_event.is_pending:
+            self._dur_label.setText("正在生成报告")
+        else:
+            self._dur_label.setText(f"{dur}s duration")
+        code = self._lag_event.category or self._lag_event.cause_code or "UNKNOWN"
+        badge_colour = CAUSE_COLOURS.get(code, MUTED)
+        self._badge.setText(code.replace("_", " "))
+        self._badge.setStyleSheet(f"""
+            color: {badge_colour};
+            background: transparent;
+            border: 1px solid {badge_colour};
+            border-radius: 4px;
+            padding: 1px 6px;
+            font-size: 9px;
+            font-weight: 700;
+        """)
+        colour = CAUSE_COLOURS.get(code, _severity_colour(self._lag_event.peak_composite_score))
+        self._dot.setStyleSheet(f"color: {colour}; font-size: 10px;")
 
     def _on_delete_clicked(self):
         self.delete_requested.emit(self._lag_event)
@@ -252,6 +267,14 @@ class EventLogWidget(QWidget):
         self._rows.insert(0, row)
         self._list_layout.insertWidget(0, row)
         self._refresh_state()
+
+    def upsert_event(self, event: LagEvent):
+        for row in self._rows:
+            if row._lag_event is event or (event.id and row._lag_event.id == event.id):
+                row._lag_event = event
+                row.refresh()
+                return
+        self.add_event(event)
 
     def remove_event(self, event: LagEvent) -> bool:
         for row in list(self._rows):

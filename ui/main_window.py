@@ -178,6 +178,7 @@ class MainWindow(QMainWindow):
         self._compat_detector = compat_detector
 
         self._active_event: LagEvent | None = None
+        self._pending_frame_event: LagEvent | None = None
         self._window_candidates: list[GameWindowCandidate] = []
         self._window_candidates_key: tuple[tuple[int, int, str, int, int], ...] | None = None
         self._deferred_candidates: list[GameWindowCandidate] | None = None
@@ -191,6 +192,7 @@ class MainWindow(QMainWindow):
         self._pending_compat_metrics: CompatibilityMetricsSnapshot | None = None
         self._snapshot_cache: dict[int, LagSnapshot | None] = {}
         self._selected_event_id: int | None = None
+        self._selected_event_ref: LagEvent | None = None
         self._last_metrics_ui_ts = 0.0
         self._last_statusbar_text = ""
         self._last_statusbar_ts = 0.0
@@ -241,7 +243,14 @@ class MainWindow(QMainWindow):
         self._baseline_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         header.addWidget(title)
         header.addStretch()
+        self._report_lang_combo = QComboBox()
+        self._report_lang_combo.addItem("报告：中文", "zh")
+        self._report_lang_combo.addItem("Report: English", "en")
+        self._report_lang_combo.setCurrentIndex(0)
+        self._report_lang_combo.setMinimumWidth(130)
         header.addWidget(self._baseline_label)
+        header.addSpacing(10)
+        header.addWidget(self._report_lang_combo)
         header.addSpacing(16)
         header.addWidget(self._status_dot)
         root.addLayout(header)
@@ -352,6 +361,7 @@ class MainWindow(QMainWindow):
         self._event_log.event_selected.connect(self._on_event_selected)
         self._event_log.event_delete_requested.connect(self._on_event_delete_requested)
         self._event_log.clear_all_requested.connect(self._on_clear_all_events_requested)
+        self._report_lang_combo.currentIndexChanged.connect(self._on_report_language_changed)
         self._auto_checkbox.toggled.connect(self._on_auto_toggled)
         self._candidate_combo.currentIndexChanged.connect(self._on_candidate_selected)
         self._apply_target_btn.clicked.connect(self._apply_manual_target)
@@ -436,9 +446,13 @@ class MainWindow(QMainWindow):
             started_at=started_at,
             ended_at=None,
             peak_composite_score=0.0,
-            cause="",
-            cause_code="",
+            cause="This stutter is still in progress. The final report will be filled in after the game recovers.",
+            cause_code="REPORT_PENDING",
+            category="REPORT_PENDING",
+            scope="UNDETERMINED",
+            is_pending=True,
         )
+        self._event_log.upsert_event(self._active_event)
         self._set_status_message(f"⚠  Lag event started at {started_at.strftime('%H:%M:%S')}", force=True)
 
     @Slot(object, float)
@@ -455,11 +469,14 @@ class MainWindow(QMainWindow):
         snapshot = self._recorder.capture(event)
 
         # Analyse cause
-        cause_code, cause = self._analyzer.analyze(
+        category, cause, scope = self._analyzer.analyze(
             snapshot.peak_sample, snapshot.pre_lag_samples
         )
         event.cause = cause
-        event.cause_code = cause_code
+        event.cause_code = category
+        event.category = category
+        event.scope = scope
+        event.is_pending = False
 
         # Persist
         event_id = self._storage.save_event(event)
@@ -467,13 +484,16 @@ class MainWindow(QMainWindow):
         snapshot.event_id = event_id
         self._storage.save_snapshot(snapshot)
         self._snapshot_cache[event_id] = snapshot
+        if self._selected_event_ref is event:
+            self._selected_event_id = event_id
+            self._detail_panel.show_event(event, snapshot)
 
         # Update UI
-        self._event_log.add_event(event)
+        self._event_log.upsert_event(event)
         count = self._storage.event_count()
         self._event_count_label.setText(f"已记录 {count} 个事件")
         self._set_status_message(
-            f"✓  卡顿结束 — {round(event.duration_seconds, 1)} 秒 — {cause_code}"
+            f"✓  卡顿结束 — {round(event.duration_seconds, 1)} 秒 — {category}"
             , force=True
         )
 
@@ -481,7 +501,7 @@ class MainWindow(QMainWindow):
         if self._tray and self._tray.isVisible():
             self._tray.showMessage(
                 "检测到卡顿事件",
-                f"{cause_code}: {cause[:80]}…" if len(cause) > 80 else cause,
+                f"{category}: {cause[:80]}…" if len(cause) > 80 else cause,
                 QSystemTrayIcon.MessageIcon.Warning,
                 4000,
             )
@@ -501,8 +521,12 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_event_selected(self, event: LagEvent):
+        self._selected_event_ref = event
         event_id = event.id
         self._selected_event_id = event_id
+        if event.is_pending or event_id is None:
+            self._detail_panel.show_loading_event(event)
+            return
         if event_id and event_id in self._snapshot_cache:
             self._detail_panel.show_event(event, self._snapshot_cache[event_id])
             return
@@ -525,14 +549,19 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_event_delete_requested(self, event: LagEvent):
+        if event is self._active_event:
+            self._active_event = None
+        if event is self._pending_frame_event:
+            self._pending_frame_event = None
         deleted = self._storage.delete_event(event.id)
-        if not deleted:
+        if event.id and not deleted:
             self._set_status_message("删除卡顿报告失败：记录不存在或已被删除", force=True)
             return
         if event.id:
             self._snapshot_cache.pop(event.id, None)
         if self._selected_event_id == event.id:
             self._selected_event_id = None
+            self._selected_event_ref = None
         self._event_log.remove_event(event)
         self._detail_panel.clear_event()
         count = self._storage.event_count()
@@ -547,10 +576,18 @@ class MainWindow(QMainWindow):
             return
         self._snapshot_cache.clear()
         self._selected_event_id = None
+        self._selected_event_ref = None
         self._event_log.clear_events()
         self._detail_panel.clear_event()
         self._event_count_label.setText("已记录 0 个事件")
         self._set_status_message(f"已清空 {removed} 条卡顿报告", force=True)
+
+    @Slot(int)
+    def _on_report_language_changed(self, _index: int):
+        language = self._report_lang_combo.currentData()
+        if not language:
+            language = "zh"
+        self._detail_panel.set_report_language(str(language))
 
     @Slot(bool)
     def _on_auto_toggled(self, enabled: bool):
@@ -789,19 +826,39 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_frame_stutter_started(self, started_at: datetime):
+        self._pending_frame_event = LagEvent(
+            id=None,
+            started_at=started_at,
+            ended_at=None,
+            peak_composite_score=0.0,
+            cause="This stutter is still in progress. The final report will be filled in after the game recovers.",
+            cause_code="REPORT_PENDING",
+            category="REPORT_PENDING",
+            scope="UNDETERMINED",
+            is_pending=True,
+        )
+        self._event_log.upsert_event(self._pending_frame_event)
         self.statusBar().showMessage(f"帧时间卡顿开始于 {started_at.strftime('%H:%M:%S')}")
 
     @Slot(object)
     def _on_frame_stutter_ended(self, episode: FrameStutterEpisode):
-        event = LagEvent(
+        event = self._pending_frame_event or LagEvent(
             id=None,
             started_at=episode.started_at,
             ended_at=episode.ended_at,
             peak_composite_score=episode.severity,
-            cause=episode.explanation,
-            cause_code=EVENT_LABELS.get(episode.event_type, episode.event_type),
-            duration_seconds=(episode.ended_at - episode.started_at).total_seconds(),
+            cause="",
+            cause_code="",
         )
+        event.started_at = episode.started_at
+        event.ended_at = episode.ended_at
+        event.peak_composite_score = episode.severity
+        event.duration_seconds = (episode.ended_at - episode.started_at).total_seconds()
+        event.cause = episode.explanation
+        event.category = episode.category or self._classify_frame_category(episode)
+        event.cause_code = event.category
+        event.scope = episode.scope or "LOCAL"
+        event.is_pending = False
 
         event_id = self._storage.save_event(event)
         event.id = event_id
@@ -809,13 +866,17 @@ class MainWindow(QMainWindow):
         snapshot.event_id = event_id
         self._storage.save_snapshot(snapshot)
         self._snapshot_cache[event_id] = snapshot
+        if self._selected_event_ref is event:
+            self._selected_event_id = event_id
+            self._detail_panel.show_event(event, snapshot)
 
-        self._event_log.add_event(event)
+        self._event_log.upsert_event(event)
         count = self._storage.event_count()
         self._event_count_label.setText(f"已记录 {count} 个事件")
         self.statusBar().showMessage(
-            f"已记录 {EVENT_LABELS.get(episode.event_type, episode.event_type)} — 峰值 {episode.peak_frame_time_ms:.1f} ms"
+            f"已记录 {event.category} — 峰值 {episode.peak_frame_time_ms:.1f} ms"
         )
+        self._pending_frame_event = None
 
     @Slot(str)
     def _on_capture_error(self, message: str):
@@ -1060,6 +1121,16 @@ class MainWindow(QMainWindow):
         }:
             return selected_name, selected_pid
         return target, None
+
+    @staticmethod
+    def _classify_frame_category(episode: FrameStutterEpisode) -> str:
+        if episode.peak_gpu_busy_ms >= max(12.0, episode.peak_cpu_wait_ms + 2.0):
+            return "GPU_BOUND"
+        if episode.peak_cpu_wait_ms >= max(18.0, episode.peak_gpu_busy_ms):
+            return "CPU_BOUND"
+        if episode.event_type == "FRAME_FREEZE":
+            return "LOCAL_STUTTER"
+        return "LOCAL_STUTTER"
 
     def _flash_button(self, button: QPushButton, status_text: str):
         button.setProperty("active", True)

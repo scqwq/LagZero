@@ -49,6 +49,8 @@ class LagEventRow(Base):
     peak_composite_score = Column(Float, default=0.0)
     cause = Column(Text, default="")
     cause_code = Column(String(64), default="UNKNOWN")
+    category = Column(String(64), default="")
+    scope = Column(String(64), default="")
     duration_seconds = Column(Float, default=0.0)
 
     snapshots = relationship("LagSnapshotRow", back_populates="event", cascade="all, delete-orphan")
@@ -79,6 +81,18 @@ class Storage:
         _ensure_data_dir()
         self._engine = create_engine(f"sqlite:///{db_path}", echo=False)
         Base.metadata.create_all(self._engine)
+        self._ensure_schema()
+
+    def _ensure_schema(self):
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(lag_events)").fetchall()
+            }
+            if "category" not in existing:
+                conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN category VARCHAR(64) DEFAULT ''")
+            if "scope" not in existing:
+                conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN scope VARCHAR(64) DEFAULT ''")
 
     # ------------------------------------------------------------------
     # Write
@@ -101,6 +115,8 @@ class Storage:
             row.peak_composite_score = event.peak_composite_score
             row.cause = event.cause
             row.cause_code = event.cause_code
+            row.category = event.category
+            row.scope = event.scope
             row.duration_seconds = event.duration_seconds
 
             session.commit()
@@ -215,6 +231,8 @@ class Storage:
             peak_composite_score=row.peak_composite_score,
             cause=row.cause,
             cause_code=row.cause_code,
+            category=row.category or "",
+            scope=row.scope or "",
             duration_seconds=row.duration_seconds,
         )
 
