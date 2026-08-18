@@ -50,8 +50,6 @@ class SnapshotRecorder:
 
         if peak is None:
             # Shouldn't happen in practice, but guard defensively
-            from datetime import datetime
-            from core.models import ProcessSample
             peak = SystemSample(
                 timestamp=datetime.now(),
                 cpu_percent=0, cpu_per_core=[], ram_percent=0,

@@ -34,6 +34,14 @@ CAUSE_COLOURS = {
     "BACKGROUND_CLUSTER":   AMBER,
     "DISK_IO":              "#1abc9c",
     "SCHEDULER_CONTENTION": MUTED,
+    "FRAME_SPIKE":          ACCENT,
+    "FRAME_STUTTER":        "#e67e22",
+    "FRAME_FREEZE":         RED,
+    "Window Not Responding": RED,
+    "Visual Freeze":        ACCENT,
+    "Responsiveness Stall": AMBER,
+    "CPU Pressure Stall":   RED,
+    "I/O Pressure Stall":   "#1abc9c",
     "UNKNOWN":              MUTED,
 }
 
@@ -53,7 +61,7 @@ class EventRow(QFrame):
 
     def __init__(self, event: LagEvent, parent=None):
         super().__init__(parent)
-        self.event = event
+        self._lag_event = event
         self._selected = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._build()
@@ -67,13 +75,13 @@ class EventRow(QFrame):
         # Colour dot
         dot = QLabel("●")
         dot.setFixedWidth(14)
-        colour = _severity_colour(self.event.peak_composite_score)
+        colour = _severity_colour(self._lag_event.peak_composite_score)
         dot.setStyleSheet(f"color: {colour}; font-size: 10px;")
 
         # Time + duration
-        time_str = self.event.started_at.strftime("%H:%M:%S")
-        date_str = self.event.started_at.strftime("%b %d")
-        dur = round(self.event.duration_seconds, 1)
+        time_str = self._lag_event.started_at.strftime("%H:%M:%S")
+        date_str = self._lag_event.started_at.strftime("%b %d")
+        dur = round(self._lag_event.duration_seconds, 1)
 
         info = QVBoxLayout()
         info.setSpacing(2)
@@ -86,7 +94,7 @@ class EventRow(QFrame):
         info.addWidget(dur_label)
 
         # Cause badge
-        code = self.event.cause_code or "UNKNOWN"
+        code = self._lag_event.cause_code or "UNKNOWN"
         badge_colour = CAUSE_COLOURS.get(code, MUTED)
         badge = QLabel(code.replace("_", " "))
         badge.setStyleSheet(f"""
@@ -123,7 +131,7 @@ class EventRow(QFrame):
         self._set_style(val)
 
     def mousePressEvent(self, event):
-        self.clicked.emit(self.event)
+        self.clicked.emit(self._lag_event)
         super().mousePressEvent(event)
 
 
@@ -148,7 +156,7 @@ class EventLogWidget(QWidget):
 
         # Header
         header = QHBoxLayout()
-        title = QLabel("LAG EVENTS")
+        title = QLabel("卡顿事件")
         title.setStyleSheet(f"color: {MUTED}; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
         self._count_label = QLabel("0")
         self._count_label.setStyleSheet(f"""
@@ -180,9 +188,9 @@ class EventLogWidget(QWidget):
         layout.addWidget(scroll, stretch=1)
 
         # Empty state
-        self._empty_label = QLabel("No lag events yet.\nMonitoring your system…")
+        self._empty_label = QLabel("暂时还没有卡顿事件。\n正在持续监控你的系统…")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_label.setStyleSheet(f"color: {MUTED}; font-size: 12px; line-height: 1.6;")
+        self._empty_label.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
         self._list_layout.insertWidget(0, self._empty_label)
 
     def add_event(self, event: LagEvent):
@@ -203,7 +211,7 @@ class EventLogWidget(QWidget):
             self._selected_row.set_selected(False)
         # Find and select clicked row
         for row in self._rows:
-            if row.event is event or row.event.id == event.id:
+            if row._lag_event is event or row._lag_event.id == event.id:
                 row.set_selected(True)
                 self._selected_row = row
                 break

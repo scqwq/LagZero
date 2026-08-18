@@ -33,6 +33,14 @@ CAUSE_ICONS = {
     "BACKGROUND_CLUSTER":   "🐝",
     "DISK_IO":              "💿",
     "SCHEDULER_CONTENTION": "⚙️",
+    "FRAME_SPIKE":          "📉",
+    "FRAME_STUTTER":        "🎞️",
+    "FRAME_FREEZE":         "🧊",
+    "Window Not Responding": "🧊",
+    "Visual Freeze":        "🖼️",
+    "Responsiveness Stall": "⏱️",
+    "CPU Pressure Stall":   "🔥",
+    "I/O Pressure Stall":   "💿",
     "UNKNOWN":              "❓",
 }
 
@@ -43,6 +51,14 @@ CAUSE_COLOURS = {
     "BACKGROUND_CLUSTER":   AMBER,
     "DISK_IO":              "#1abc9c",
     "SCHEDULER_CONTENTION": MUTED,
+    "FRAME_SPIKE":          ACCENT,
+    "FRAME_STUTTER":        "#e67e22",
+    "FRAME_FREEZE":         RED,
+    "Window Not Responding": RED,
+    "Visual Freeze":        ACCENT,
+    "Responsiveness Stall": AMBER,
+    "CPU Pressure Stall":   RED,
+    "I/O Pressure Stall":   "#1abc9c",
     "UNKNOWN":              MUTED,
 }
 
@@ -99,9 +115,9 @@ class DetailPanelWidget(QWidget):
     def _build_empty(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 0, 0, 0)
-        placeholder = QLabel("← Select a lag event\nto see the full diagnosis")
+        placeholder = QLabel("← 选择左侧卡顿事件\n查看完整诊断信息")
         placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder.setStyleSheet(f"color: {MUTED}; font-size: 14px; line-height: 1.8;")
+        placeholder.setStyleSheet(f"color: {MUTED}; font-size: 14px;")
         layout.addWidget(placeholder)
         self._layout = layout
 
@@ -151,7 +167,7 @@ class DetailPanelWidget(QWidget):
 
         explanation = QLabel(event.cause or "No explanation available.")
         explanation.setWordWrap(True)
-        explanation.setStyleSheet(f"color: {TEXT}; font-size: 12px; line-height: 1.6;")
+        explanation.setStyleSheet(f"color: {TEXT}; font-size: 12px;")
 
         cf_layout.addWidget(code_label)
         cf_layout.addWidget(meta_label)
@@ -160,7 +176,7 @@ class DetailPanelWidget(QWidget):
 
         # ── Peak metrics ──────────────────────────────────────────────
         if snapshot:
-            cl.addWidget(SectionHeader("Peak Metrics"))
+            cl.addWidget(SectionHeader("峰值指标"))
             chips_row = QHBoxLayout()
             cpu_c = RED if snapshot.peak_cpu > 80 else AMBER if snapshot.peak_cpu > 60 else GREEN
             ram_c = RED if snapshot.peak_ram > 88 else AMBER if snapshot.peak_ram > 70 else GREEN
@@ -176,7 +192,7 @@ class DetailPanelWidget(QWidget):
 
             # ── Pre-lag timeline ──────────────────────────────────────
             if snapshot.pre_lag_samples:
-                cl.addWidget(SectionHeader("Pre-Lag Timeline (last 5s)"))
+                cl.addWidget(SectionHeader("卡顿前时间线（最近 5 秒）"))
                 timeline_frame = QFrame()
                 timeline_frame.setStyleSheet(f"background: {BG2}; border-radius: 6px;")
                 tl = QGridLayout(timeline_frame)
@@ -208,7 +224,7 @@ class DetailPanelWidget(QWidget):
 
             # ── Top processes ─────────────────────────────────────────
             if snapshot.top_processes:
-                cl.addWidget(SectionHeader("Top Processes at Peak"))
+                cl.addWidget(SectionHeader("峰值时刻主要进程"))
                 proc_frame = QFrame()
                 proc_frame.setStyleSheet(f"background: {BG2}; border-radius: 6px;")
                 pl = QVBoxLayout(proc_frame)
