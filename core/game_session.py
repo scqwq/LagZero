@@ -104,10 +104,6 @@ def _candidate_from_hwnd(hwnd: int, foreground_hwnd: int | None = None) -> GameW
     if not hwnd or not user32.IsWindowVisible(hwnd):
         return None
 
-    title = _window_title(hwnd)
-    if not title:
-        return None
-
     width, height = _window_rect(hwnd)
     if width < MIN_WINDOW_WIDTH or height < MIN_WINDOW_HEIGHT:
         return None
@@ -121,6 +117,13 @@ def _candidate_from_hwnd(hwnd: int, foreground_hwnd: int | None = None) -> GameW
     if not process_name:
         return None
 
+    title = _window_title(hwnd)
+    is_foreground = int(hwnd) == int(foreground_hwnd or 0)
+    if not title:
+        if not is_foreground:
+            return None
+        title = process_name
+
     return GameWindowCandidate(
         hwnd=int(hwnd),
         pid=int(pid.value),
@@ -128,7 +131,7 @@ def _candidate_from_hwnd(hwnd: int, foreground_hwnd: int | None = None) -> GameW
         title=title,
         width=width,
         height=height,
-        is_foreground=int(hwnd) == int(foreground_hwnd or 0),
+        is_foreground=is_foreground,
     )
 
 

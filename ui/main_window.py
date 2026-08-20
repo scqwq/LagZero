@@ -689,7 +689,13 @@ class MainWindow(QMainWindow):
                 if changed or self._presentmon._process.state() == self._presentmon._process.ProcessState.NotRunning:
                     self._presentmon.start_capture()
         else:
-            self._window_label.setText("前台窗口：未检测到游戏")
+            target_desc = ""
+            if self._presentmon is not None:
+                target_desc = self._presentmon.target_description()
+            if target_desc and target_desc != "No target":
+                self._window_label.setText(f"前台窗口：未检测到游戏（当前采集目标 {target_desc}）")
+            else:
+                self._window_label.setText("前台窗口：未检测到游戏")
             if self._auto_attach and hasattr(self._collector, "set_tracked_process"):
                 self._collector.set_tracked_process("", None)
 
@@ -765,7 +771,7 @@ class MainWindow(QMainWindow):
             or "no frame data" in lowered
         ):
             self._set_capture_metrics_unavailable("无数据")
-        if any(token in lowered for token in ["1450", "access denied", "no frame data", "capture failed"]):
+        if any(token in lowered for token in ["1450", "access denied", "capture failed"]):
             self._activate_compatibility_mode(message)
         self._set_status_message(message)
 

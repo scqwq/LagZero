@@ -176,6 +176,7 @@ class PresentMonBridge(QObject):
 
         self._target_process = ""
         self._target_pid: int | None = None
+        self._prefer_process_name_match = False
         self._last_metrics_ts: datetime | None = None
         self._received_frame = False
         self._received_header = False
@@ -223,6 +224,7 @@ class PresentMonBridge(QObject):
             return False
         self._target_process = target
         self._target_pid = pid_value
+        self._prefer_process_name_match = False
         self.target_changed.emit(self.target_description())
         self._emit_capture_identity(f"Requested: {self.target_description()}")
         self._emit_diagnostics(force=True)
@@ -232,7 +234,8 @@ class PresentMonBridge(QObject):
 
     def target_description(self) -> str:
         if self._target_pid:
-            return f"PID {self._target_pid} ({self._target_process or 'unknown'})"
+            suffix = " via name match" if self._prefer_process_name_match and self._target_process else ""
+            return f"PID {self._target_pid} ({self._target_process or 'unknown'}){suffix}"
         if self._target_process:
             return self._target_process
         return "No target"
@@ -270,7 +273,7 @@ class PresentMonBridge(QObject):
             "--session_name",
             self._session_name,
         ]
-        if self._target_pid:
+        if self._target_pid and not self._prefer_process_name_match:
             args.extend(["--process_id", str(self._target_pid)])
         elif self._target_process:
             args.extend(["--process_name", self._target_process])
@@ -422,12 +425,8 @@ class PresentMonBridge(QObject):
                 self.error_occurred.emit(
                     "PresentMon failed with trace session error 1450. Try 'Clean Stale Sessions' first; if it persists, reboot Windows."
                 )
-                if not self._auto_retry_done:
-                    self._auto_retry_done = True
-                    self._set_status("Retrying capture after stale-session cleanup")
-                    self._pending_restart = True
-                    self.stop_capture()
-                    return
+                self._set_status("PresentMon trace session error 1450. Waiting for manual cleanup.")
+                return
             if "events were lost" in lowered or "30034" in lowered or "18717" in lowered:
                 self._set_status("PresentMon warning: ETW events were lost; capture may be incomplete.")
                 return
@@ -465,9 +464,9 @@ class PresentMonBridge(QObject):
 
     def _on_process_finished(self, exit_code: int, _status):
         self._startup_timer.stop()
-        if self._auto_retry_done and "1450" in self._last_error_text:
-            self.cleanup_stale_sessions()
-        if not self._received_frame and exit_code != 0:
+        if self._pending_restart:
+            self._set_status(f"Restarting capture for {self.target_description()}…")
+        elif not self._received_frame and exit_code != 0:
             self._set_status(f"Capture failed ({exit_code})")
         else:
             self._set_status(f"Capture exited ({exit_code})")
@@ -496,9 +495,23 @@ class PresentMonBridge(QObject):
                 "Minecraft 1.8.9 and other legacy Java/OpenGL titles often do not expose PresentMon high-precision frame events."
             )
             return
+        if self._retry_with_process_name():
+            return
         self._set_status(
-            f"No frame data for {self.target_description()} yet. Use the exact .exe name or pick a detected window."
+            f"No frame data for {self.target_description()} yet. "
+            "Use the exact .exe name, pick a detected foreground window, or run 'Probe Present' to find the real presenting process."
         )
+
+    def _retry_with_process_name(self) -> bool:
+        if self._prefer_process_name_match or not self._target_pid or not self._target_process:
+            return False
+        self._prefer_process_name_match = True
+        self._startup_timeout_notified = False
+        self._set_status(
+            f"No frame data for PID {self._target_pid}. Retrying PresentMon with process name {self._target_process}."
+        )
+        self.restart_capture()
+        return True
 
     def _resolve_executable(self) -> Path:
         if self._executable.exists():
