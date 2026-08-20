@@ -125,6 +125,7 @@ class CompatibilityStutterDetector(QObject):
         p95_response = response_sorted[p95_idx]
         severity = min(1.0, max(self._peak_response_ms / 400.0, p95_response / 250.0))
         explanation = self._build_explanation(avg_response, p95_response)
+        category = self._classify_category()
         return FrameStutterEpisode(
             started_at=self._started_at,
             ended_at=ended_at,
@@ -140,6 +141,8 @@ class CompatibilityStutterDetector(QObject):
             present_mode="compatibility",
             severity=severity,
             explanation=explanation,
+            category=category,
+            scope="LOCAL",
         )
 
     def _build_explanation(self, avg_response: float, p95_response: float) -> str:
@@ -157,3 +160,12 @@ class CompatibilityStutterDetector(QObject):
             f"Peak CPU usage was {self._peak_cpu:.1f}%, peak read throughput was {self._peak_read_kb_s:.0f} KB/s, "
             f"peak write throughput was {self._peak_write_kb_s:.0f} KB/s."
         )
+
+    def _classify_category(self) -> str:
+        if self._event_type == "COMPAT_CPU_PRESSURE":
+            return "CPU_BOUND"
+        if self._event_type == "COMPAT_IO_PRESSURE":
+            return "IO_STALL"
+        if self._event_type in {"COMPAT_WINDOW_HANG", "COMPAT_VISUAL_FREEZE"}:
+            return "LOCAL_STUTTER"
+        return "LOCAL_STUTTER"

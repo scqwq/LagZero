@@ -17,6 +17,10 @@ from core.models import SystemSample, ProcessSample
 CATEGORY_CPU_BOUND = "CPU_BOUND"
 CATEGORY_GPU_BOUND = "GPU_BOUND"
 CATEGORY_RAM_PRESSURE = "RAM_PRESSURE"
+CATEGORY_SYSTEM_RAM_PRESSURE = "SYSTEM_RAM_PRESSURE"
+CATEGORY_GAME_MEMORY_LIMIT = "GAME_MEMORY_LIMIT"
+CATEGORY_VRAM_PRESSURE = "VRAM_PRESSURE"
+CATEGORY_DRIVER_RENDER_PATH = "DRIVER_RENDER_PATH"
 CATEGORY_IO_STALL = "IO_STALL"
 CATEGORY_BACKGROUND_INTERFERENCE = "BACKGROUND_INTERFERENCE"
 CATEGORY_LOCAL_STUTTER = "LOCAL_STUTTER"
@@ -33,6 +37,8 @@ SWAP_ACTIVE_THRESHOLD = 5.0         # % swap used
 BACKGROUND_CLUSTER_COUNT = 5        # number of processes each contributing ≥5% CPU
 CPU_NORMAL_FOR_DISK = 55.0          # if CPU below this but lag detected → disk
 RESP_HIGH_THRESHOLD_MS = 40.0       # ms — above this is "high responsiveness delay"
+VRAM_PRESSURE_RATIO = 0.92
+TARGET_MEMORY_LIMIT_MIN_MB = 1024.0
 
 
 class CauseAnalyzer:
@@ -59,12 +65,65 @@ class CauseAnalyzer:
 
     def _rules(self):
         return [
+            self._rule_vram_pressure,
+            self._rule_game_memory_limit,
             self._rule_single_cpu_spike,
             self._rule_ram_exhaustion,
             self._rule_background_cluster,
             self._rule_disk_io,
+            self._rule_driver_render_path,
             self._rule_scheduler_contention,
         ]
+
+    def _rule_vram_pressure(
+        self, sample: SystemSample, _pre: list[SystemSample]
+    ) -> tuple[str, str, str] | None:
+        gpu = sample.gpu_memory
+        if gpu is None or gpu.local_budget_mb <= 0:
+            return None
+        if gpu.local_usage_ratio < VRAM_PRESSURE_RATIO:
+            return None
+        shared_hint = ""
+        if gpu.shared_usage_mb >= 512 and gpu.shared_usage_ratio >= 0.15:
+            shared_hint = (
+                f" Shared GPU memory was also elevated at {gpu.shared_usage_mb:.0f} MB, "
+                "which often means textures or render targets are spilling beyond local VRAM."
+            )
+        return (
+            CATEGORY_VRAM_PRESSURE,
+            f"GPU local memory usage reached {gpu.local_usage_mb:.0f} MB out of a {gpu.local_budget_mb:.0f} MB budget "
+            f"({gpu.local_usage_ratio * 100:.0f}% used). This looks like VRAM pressure rather than a pure shader/compute bottleneck."
+            f"{shared_hint}",
+            SCOPE_LOCAL,
+        )
+
+    def _rule_game_memory_limit(
+        self, sample: SystemSample, pre: list[SystemSample]
+    ) -> tuple[str, str, str] | None:
+        target = sample.target_process
+        if target is None or target.memory_mb < TARGET_MEMORY_LIMIT_MIN_MB:
+            return None
+        if sample.ram_percent >= 78.0:
+            return None
+        mem_series = [s.target_process.memory_mb for s in pre if s.target_process and s.target_process.pid == target.pid]
+        if len(mem_series) < 3:
+            return None
+        mem_max = max(mem_series)
+        mem_min = min(mem_series)
+        if mem_max <= 0:
+            return None
+        spread_ratio = (mem_max - mem_min) / mem_max
+        cpu_series = [s.target_process.cpu_percent for s in pre if s.target_process and s.target_process.pid == target.pid]
+        avg_target_cpu = sum(cpu_series) / len(cpu_series) if cpu_series else target.cpu_percent
+        if spread_ratio <= 0.12 and avg_target_cpu >= 20.0:
+            return (
+                CATEGORY_GAME_MEMORY_LIMIT,
+                f'The tracked game process "{target.name}" stayed near a narrow memory ceiling around '
+                f"{mem_max:.0f} MB even though total system RAM was not full ({sample.ram_percent:.0f}% used). "
+                "That pattern often means the game, runtime, or launch settings are limiting how much memory the game is actually using.",
+                SCOPE_LOCAL,
+            )
+        return None
 
     def _rule_single_cpu_spike(
         self, sample: SystemSample, _pre: list[SystemSample]
@@ -93,7 +152,7 @@ class CauseAnalyzer:
             total_gb = round(sample.ram_total_mb / 1024, 1)
             swap = round(sample.swap_percent, 1)
             return (
-                CATEGORY_RAM_PRESSURE,
+                CATEGORY_SYSTEM_RAM_PRESSURE,
                 f"System RAM is critically full ({used_gb} GB / {total_gb} GB used, "
                 f"{swap}% swap active). The OS is writing memory to disk (paging), "
                 f"which is much slower than RAM. Close unused applications or browser tabs.",
@@ -103,11 +162,34 @@ class CauseAnalyzer:
             used_gb = round(sample.ram_used_mb / 1024, 1)
             total_gb = round(sample.ram_total_mb / 1024, 1)
             return (
-                CATEGORY_RAM_PRESSURE,
+                CATEGORY_SYSTEM_RAM_PRESSURE,
                 f"RAM usage is very high ({used_gb} GB / {total_gb} GB). "
                 f"The system is running out of memory headroom. "
                 f"Close unused applications to free memory.",
                 SCOPE_LOCAL,
+            )
+        return None
+
+    def _rule_driver_render_path(
+        self, sample: SystemSample, pre: list[SystemSample]
+    ) -> tuple[str, str, str] | None:
+        target = sample.target_process
+        gpu = sample.gpu_memory
+        if sample.cpu_percent >= 55 or sample.ram_percent >= 85:
+            return None
+        if sample.responsiveness_ms < 18.0:
+            return None
+        if target is not None and target.cpu_percent >= 55.0:
+            return None
+        if gpu is not None and gpu.local_usage_ratio >= 0.85:
+            return None
+        rising_resp = self.pre_lag_trend(pre, "responsiveness_ms") == "rising"
+        if rising_resp:
+            return (
+                CATEGORY_DRIVER_RENDER_PATH,
+                "Local stutter was visible, but CPU, system RAM, and VRAM pressure were not dominant. "
+                "This pattern can happen with driver issues, compositor/render-path instability, overlays, or capture conflicts.",
+                SCOPE_UNDETERMINED,
             )
         return None
 
@@ -153,6 +235,17 @@ class CauseAnalyzer:
         """Fallback — general system stress, no single root cause."""
         resp = round(sample.responsiveness_ms, 1)
         cpu = round(sample.cpu_percent, 1)
+        if (
+            sample.cpu_percent < 40.0
+            and sample.ram_percent < 75.0
+            and sample.responsiveness_ms < 20.0
+        ):
+            return (
+                CATEGORY_UNDETERMINED,
+                "The game felt bad, but the current local signals are weak: CPU, RAM, and responsiveness did not show a strong local bottleneck. "
+                "This does not prove a network problem, but it means a remote/network factor is still plausible.",
+                SCOPE_UNDETERMINED,
+            )
         return (
             CATEGORY_LOCAL_STUTTER,
             f"System was under general stress (CPU: {cpu}%, responsiveness: {resp} ms) "

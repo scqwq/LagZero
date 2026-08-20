@@ -619,6 +619,8 @@ class MainWindow(QMainWindow):
         target, pid = self._resolve_capture_target(target)
         self._manual_candidate_hold_until = monotonic() + 3.0
         self._target_input.setText(target)
+        if hasattr(self._collector, "set_tracked_process"):
+            self._collector.set_tracked_process(target, pid)
         self._presentmon.set_target(target, pid=pid)
         if self._compat_capture is not None:
             self._compat_capture.set_target(target, pid=pid)
@@ -675,6 +677,8 @@ class MainWindow(QMainWindow):
             self._window_label.setText(
                 f"前台窗口：{session.process_name} — {session.window_title[:70]}"
             )
+            if hasattr(self._collector, "set_tracked_process"):
+                self._collector.set_tracked_process(session.process_name, session.pid)
             if self._auto_attach and self._presentmon is not None:
                 self._target_input.setText(session.process_name)
                 if self._frame_detector is not None:
@@ -686,6 +690,8 @@ class MainWindow(QMainWindow):
                     self._presentmon.start_capture()
         else:
             self._window_label.setText("前台窗口：未检测到游戏")
+            if self._auto_attach and hasattr(self._collector, "set_tracked_process"):
+                self._collector.set_tracked_process("", None)
 
     @Slot(object)
     def _on_candidates_changed(self, candidates: list[GameWindowCandidate]):

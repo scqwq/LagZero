@@ -17,6 +17,28 @@ class ProcessSample:
 
 
 @dataclass
+class TargetProcessMetrics:
+    pid: int
+    name: str
+    cpu_percent: float
+    memory_mb: float
+    private_memory_mb: float = 0.0
+    read_kb_s: float = 0.0
+    write_kb_s: float = 0.0
+    thread_count: int = 0
+
+
+@dataclass
+class GpuMemorySnapshot:
+    local_usage_mb: float
+    local_budget_mb: float
+    shared_usage_mb: float = 0.0
+    shared_budget_mb: float = 0.0
+    local_usage_ratio: float = 0.0
+    shared_usage_ratio: float = 0.0
+
+
+@dataclass
 class SystemSample:
     """A single 1-second snapshot of system state."""
     timestamp: datetime
@@ -28,6 +50,8 @@ class SystemSample:
     swap_percent: float
     responsiveness_ms: float    # how long a simple OS op took (ms)
     top_processes: list[ProcessSample] = field(default_factory=list)
+    target_process: Optional[TargetProcessMetrics] = None
+    gpu_memory: Optional[GpuMemorySnapshot] = None
 
 
 @dataclass

@@ -67,6 +67,8 @@ class LagSnapshotRow(Base):
     peak_responsiveness_ms = Column(Float, default=0.0)
     top_processes_json = Column(Text, default="[]")    # JSON list of {name, pid, cpu, mem}
     pre_lag_summary_json = Column(Text, default="[]")  # JSON list of {ts, cpu, ram, resp}
+    target_process_json = Column(Text, default="{}")
+    gpu_memory_json = Column(Text, default="{}")
 
     event = relationship("LagEventRow", back_populates="snapshots")
 
@@ -93,6 +95,14 @@ class Storage:
                 conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN category VARCHAR(64) DEFAULT ''")
             if "scope" not in existing:
                 conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN scope VARCHAR(64) DEFAULT ''")
+            snapshot_existing = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(lag_snapshots)").fetchall()
+            }
+            if "target_process_json" not in snapshot_existing:
+                conn.exec_driver_sql("ALTER TABLE lag_snapshots ADD COLUMN target_process_json TEXT DEFAULT '{}'")
+            if "gpu_memory_json" not in snapshot_existing:
+                conn.exec_driver_sql("ALTER TABLE lag_snapshots ADD COLUMN gpu_memory_json TEXT DEFAULT '{}'")
 
     # ------------------------------------------------------------------
     # Write
@@ -142,9 +152,42 @@ class Storage:
                     "cpu": round(s.cpu_percent, 1),
                     "ram": round(s.ram_percent, 1),
                     "resp": round(s.responsiveness_ms, 1),
+                    "target_name": s.target_process.name if s.target_process else "",
+                    "target_pid": s.target_process.pid if s.target_process else 0,
+                    "target_cpu": round(s.target_process.cpu_percent, 1) if s.target_process else 0.0,
+                    "target_mem": round(s.target_process.memory_mb, 1) if s.target_process else 0.0,
+                    "target_private_mem": round(s.target_process.private_memory_mb, 1) if s.target_process else 0.0,
+                    "gpu_local_mb": round(s.gpu_memory.local_usage_mb, 1) if s.gpu_memory else 0.0,
+                    "gpu_local_budget_mb": round(s.gpu_memory.local_budget_mb, 1) if s.gpu_memory else 0.0,
                 }
                 for s in snapshot.pre_lag_samples
             ])
+            target_json = json.dumps(
+                {
+                    "name": snapshot.peak_sample.target_process.name,
+                    "pid": snapshot.peak_sample.target_process.pid,
+                    "cpu_percent": round(snapshot.peak_sample.target_process.cpu_percent, 1),
+                    "memory_mb": round(snapshot.peak_sample.target_process.memory_mb, 1),
+                    "private_memory_mb": round(snapshot.peak_sample.target_process.private_memory_mb, 1),
+                    "read_kb_s": round(snapshot.peak_sample.target_process.read_kb_s, 1),
+                    "write_kb_s": round(snapshot.peak_sample.target_process.write_kb_s, 1),
+                    "thread_count": snapshot.peak_sample.target_process.thread_count,
+                }
+                if snapshot.peak_sample.target_process
+                else {}
+            )
+            gpu_json = json.dumps(
+                {
+                    "local_usage_mb": round(snapshot.peak_sample.gpu_memory.local_usage_mb, 1),
+                    "local_budget_mb": round(snapshot.peak_sample.gpu_memory.local_budget_mb, 1),
+                    "shared_usage_mb": round(snapshot.peak_sample.gpu_memory.shared_usage_mb, 1),
+                    "shared_budget_mb": round(snapshot.peak_sample.gpu_memory.shared_budget_mb, 1),
+                    "local_usage_ratio": round(snapshot.peak_sample.gpu_memory.local_usage_ratio, 4),
+                    "shared_usage_ratio": round(snapshot.peak_sample.gpu_memory.shared_usage_ratio, 4),
+                }
+                if snapshot.peak_sample.gpu_memory
+                else {}
+            )
 
             row = LagSnapshotRow(
                 event_id=snapshot.event_id,
@@ -154,6 +197,8 @@ class Storage:
                 peak_responsiveness_ms=snapshot.peak_responsiveness_ms,
                 top_processes_json=procs_json,
                 pre_lag_summary_json=pre_json,
+                target_process_json=target_json,
+                gpu_memory_json=gpu_json,
             )
             session.add(row)
             session.commit()
@@ -238,7 +283,7 @@ class Storage:
 
     @staticmethod
     def _row_to_snapshot(row: LagSnapshotRow) -> LagSnapshot:
-        from core.models import ProcessSample, SystemSample
+        from core.models import GpuMemorySnapshot, ProcessSample, SystemSample, TargetProcessMetrics
         procs = [
             ProcessSample(
                 pid=p["pid"],
@@ -251,6 +296,24 @@ class Storage:
         # Reconstruct minimal SystemSamples for the timeline chart
         pre_samples = []
         for s in json.loads(row.pre_lag_summary_json):
+            target_process = None
+            if s.get("target_pid"):
+                target_process = TargetProcessMetrics(
+                    pid=s["target_pid"],
+                    name=s.get("target_name", ""),
+                    cpu_percent=s.get("target_cpu", 0.0),
+                    memory_mb=s.get("target_mem", 0.0),
+                    private_memory_mb=s.get("target_private_mem", s.get("target_mem", 0.0)),
+                )
+            gpu_memory = None
+            if s.get("gpu_local_budget_mb", 0.0) > 0:
+                local_usage = s.get("gpu_local_mb", 0.0)
+                local_budget = s.get("gpu_local_budget_mb", 0.0)
+                gpu_memory = GpuMemorySnapshot(
+                    local_usage_mb=local_usage,
+                    local_budget_mb=local_budget,
+                    local_usage_ratio=(local_usage / local_budget) if local_budget > 0 else 0.0,
+                )
             pre_samples.append(SystemSample(
                 timestamp=datetime.fromisoformat(s["ts"]),
                 cpu_percent=s["cpu"],
@@ -261,7 +324,33 @@ class Storage:
                 swap_percent=0,
                 responsiveness_ms=s["resp"],
                 top_processes=[],
+                target_process=target_process,
+                gpu_memory=gpu_memory,
             ))
+        target_payload = json.loads(row.target_process_json or "{}")
+        target_process = None
+        if target_payload.get("pid"):
+            target_process = TargetProcessMetrics(
+                pid=target_payload["pid"],
+                name=target_payload.get("name", ""),
+                cpu_percent=target_payload.get("cpu_percent", 0.0),
+                memory_mb=target_payload.get("memory_mb", 0.0),
+                private_memory_mb=target_payload.get("private_memory_mb", target_payload.get("memory_mb", 0.0)),
+                read_kb_s=target_payload.get("read_kb_s", 0.0),
+                write_kb_s=target_payload.get("write_kb_s", 0.0),
+                thread_count=target_payload.get("thread_count", 0),
+            )
+        gpu_payload = json.loads(row.gpu_memory_json or "{}")
+        gpu_memory = None
+        if gpu_payload.get("local_budget_mb", 0.0) > 0:
+            gpu_memory = GpuMemorySnapshot(
+                local_usage_mb=gpu_payload.get("local_usage_mb", 0.0),
+                local_budget_mb=gpu_payload.get("local_budget_mb", 0.0),
+                shared_usage_mb=gpu_payload.get("shared_usage_mb", 0.0),
+                shared_budget_mb=gpu_payload.get("shared_budget_mb", 0.0),
+                local_usage_ratio=gpu_payload.get("local_usage_ratio", 0.0),
+                shared_usage_ratio=gpu_payload.get("shared_usage_ratio", 0.0),
+            )
 
         return LagSnapshot(
             id=row.id,
@@ -278,6 +367,8 @@ class Storage:
                 swap_percent=0,
                 responsiveness_ms=row.peak_responsiveness_ms,
                 top_processes=procs,
+                target_process=target_process,
+                gpu_memory=gpu_memory,
             ),
             top_processes=procs,
             peak_cpu=row.peak_cpu,

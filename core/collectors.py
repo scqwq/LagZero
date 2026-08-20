@@ -11,10 +11,12 @@ from datetime import datetime
 import psutil
 from PySide6.QtCore import QThread, Signal
 
-from core.models import SystemSample, ProcessSample
+from core.gpu_stats import query_gpu_memory
+from core.models import SystemSample, ProcessSample, TargetProcessMetrics
 
 
 PROCESS_REFRESH_INTERVAL = 3
+GPU_REFRESH_INTERVAL = 2
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +65,11 @@ class SystemCollector(QThread):
         self._running = False
         self._collect_count = 0
         self._last_top_processes: list[ProcessSample] = []
+        self._tracked_process_name = ""
+        self._tracked_process_pid: int | None = None
+        self._tracked_process: psutil.Process | None = None
+        self._last_tracked_io: tuple[int, int, float] | None = None
+        self._last_gpu_memory = None
 
     # ------------------------------------------------------------------
     def run(self):
@@ -85,6 +92,12 @@ class SystemCollector(QThread):
     def stop(self):
         self._running = False
         self.wait(2000)
+
+    def set_tracked_process(self, process_name: str = "", pid: int | None = None):
+        self._tracked_process_name = (process_name or "").strip()
+        self._tracked_process_pid = pid if pid and pid > 0 else None
+        self._tracked_process = None
+        self._last_tracked_io = None
 
     def _prime_counters(self):
         # Prime psutil CPU counters in the worker thread so startup UI is not blocked.
@@ -118,6 +131,9 @@ class SystemCollector(QThread):
         ):
             self._last_top_processes = self._top_processes()
         processes = self._last_top_processes
+        target_process = self._collect_tracked_process()
+        if self._collect_count % GPU_REFRESH_INTERVAL == 1 or self._last_gpu_memory is None:
+            self._last_gpu_memory = query_gpu_memory()
 
         return SystemSample(
             timestamp=now,
@@ -129,6 +145,8 @@ class SystemCollector(QThread):
             swap_percent=swap.percent,
             responsiveness_ms=responsiveness,
             top_processes=processes,
+            target_process=target_process,
+            gpu_memory=self._last_gpu_memory,
         )
 
     def _top_processes(self) -> list[ProcessSample]:
@@ -152,3 +170,66 @@ class SystemCollector(QThread):
         # Sort by CPU first, then RAM as tiebreaker
         procs.sort(key=lambda p: (p.cpu_percent, p.memory_mb), reverse=True)
         return procs[: self.top_n]
+
+    def _collect_tracked_process(self) -> TargetProcessMetrics | None:
+        process = self._resolve_tracked_process()
+        if process is None:
+            return None
+        try:
+            mem_info = process.memory_info()
+            io_counters = process.io_counters()
+            cpu_percent = process.cpu_percent(interval=None)
+            thread_count = process.num_threads()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            self._tracked_process = None
+            return None
+
+        now = time.perf_counter()
+        read_kb_s = 0.0
+        write_kb_s = 0.0
+        current_io = (io_counters.read_bytes, io_counters.write_bytes, now)
+        if self._last_tracked_io is not None:
+            prev_read, prev_write, prev_ts = self._last_tracked_io
+            elapsed = max(now - prev_ts, 0.001)
+            read_kb_s = max(0.0, (current_io[0] - prev_read) / 1024.0 / elapsed)
+            write_kb_s = max(0.0, (current_io[1] - prev_write) / 1024.0 / elapsed)
+        self._last_tracked_io = current_io
+        return TargetProcessMetrics(
+            pid=process.pid,
+            name=process.name(),
+            cpu_percent=cpu_percent,
+            memory_mb=mem_info.rss / (1024 ** 2),
+            private_memory_mb=getattr(mem_info, "private", 0.0) / (1024 ** 2) if getattr(mem_info, "private", None) is not None else mem_info.rss / (1024 ** 2),
+            read_kb_s=read_kb_s,
+            write_kb_s=write_kb_s,
+            thread_count=thread_count,
+        )
+
+    def _resolve_tracked_process(self) -> psutil.Process | None:
+        if self._tracked_process is not None:
+            try:
+                if self._tracked_process.is_running():
+                    return self._tracked_process
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                self._tracked_process = None
+        if self._tracked_process_pid:
+            try:
+                self._tracked_process = psutil.Process(self._tracked_process_pid)
+                self._tracked_process.cpu_percent(interval=None)
+                return self._tracked_process
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                self._tracked_process = None
+                return None
+        if not self._tracked_process_name:
+            return None
+        lowered = self._tracked_process_name.lower()
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if (proc.info.get("name") or "").lower() == lowered:
+                    self._tracked_process_pid = proc.info["pid"]
+                    self._tracked_process = psutil.Process(proc.info["pid"])
+                    self._tracked_process.cpu_percent(interval=None)
+                    return self._tracked_process
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return None
