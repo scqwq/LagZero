@@ -43,6 +43,10 @@ ui/
 
 线程图（`main.py`）：解析器与两个检测器各占一个 `QThread`，`SystemCollector` 自身是 `QThread`，UI 只通过信号收结果 —— 这是"不让界面卡顿"的主要手段。UI 侧再做节流（`_metrics_timer` 250ms、`_set_capture_diag_text` 最小间隔 0.35–0.75s、状态栏去重）。
 
+**持久化必须离开 UI 线程**（本轮修复）：`save_event`/`save_snapshot`/`event_count` 曾直接在 `_on_lag_ended`/`_on_frame_stutter_ended` 槽里执行，SQLAlchemy Session + 提交正好堵在用户切换报告时。现在写入经 `_persist_event_async` 丢给 daemon 线程，完成后 `event_persisted` 信号回 UI 线程补 id；`event_count` 同样异步（`event_count_loaded`）。Storage 引擎相应加固：WAL 模式（读写不再全库互斥）、`busy_timeout=10s`、NullPool（每 Session 独立连接，连接不跨线程复用）。实测 40 并发读写零错误。
+
+**实时指标窗口是时间窗口不是帧数窗口**（本轮修复）：`_PresentMonParser._recent_frames` 曾是 `deque(maxlen=180)`——240fps 下 0.75 秒，但 20fps 下 9 秒，低帧率游戏的 FPS/均值/P95 面板滞后十几秒才反映变化。现在 `METRICS_WINDOW_S = 2.0` 秒时间窗口（deque maxlen=4096 兜底防失控），`_trim_recent_frames()` 按解析时刻墙钟裁剪，任何帧率下面板滞后 ≤ ~2.2 秒。
+
 ## 探测数据
 
 **高精度模式（PresentMon `--v2_metrics`，本轮已切换）**，23 列，解析后进 `FrameSample`（`core/models.py`）：

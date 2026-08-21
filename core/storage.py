@@ -15,9 +15,10 @@ from pathlib import Path
 
 from sqlalchemy import (
     Column, Integer, Float, String, DateTime, Text, ForeignKey,
-    create_engine, delete, select
+    create_engine, delete, select, text
 )
 from sqlalchemy.orm import DeclarativeBase, Session, relationship
+from sqlalchemy.pool import NullPool
 
 from core.models import LagEvent, LagSnapshot
 
@@ -30,6 +31,34 @@ DB_PATH = Path(__file__).parent.parent / "data" / "lag_history.db"
 
 def _ensure_data_dir():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _build_engine(db_path: Path):
+    """
+    Engine shared by the UI thread and the persistence worker threads.
+
+    SQLite's default journal mode locks the whole database file for every
+    writer and every reader: a snapshot save from the UI thread while a
+    background read was in flight would block on the file lock, which showed
+    up as the UI stuttering exactly when events landed. WAL mode lets one
+    writer proceed alongside concurrent readers, busy_timeout waits out short
+    contention instead of raising, and NullPool gives every Session its own
+    fresh connection so a pooled connection never hops between threads.
+    """
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        echo=False,
+        poolclass=NullPool,
+        connect_args={
+            "check_same_thread": False,
+            "timeout": 10,
+        },
+    )
+    with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+        conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
+        conn.exec_driver_sql("PRAGMA busy_timeout=10000")
+    return engine
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +114,7 @@ class Storage:
 
     def __init__(self, db_path: Path = DB_PATH):
         _ensure_data_dir()
-        self._engine = create_engine(f"sqlite:///{db_path}", echo=False)
+        self._engine = _build_engine(db_path)
         Base.metadata.create_all(self._engine)
         self._ensure_schema()
 

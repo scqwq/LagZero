@@ -160,6 +160,11 @@ class MainWindow(QMainWindow):
     recovery_completed = Signal(object)
     frame_detector_reset_requested = Signal()
     snapshot_loaded = Signal(object, object)
+    # Emitted by the persistence worker when an event write lands, so the UI
+    # can fill in row ids and refresh the cached report without ever touching
+    # SQLAlchemy on the GUI thread.
+    event_persisted = Signal(object, int, object, int)
+    event_count_loaded = Signal(int)
 
     def __init__(
         self,
@@ -395,6 +400,8 @@ class MainWindow(QMainWindow):
         self.probe_completed.connect(self._on_probe_completed)
         self.recovery_completed.connect(self._on_recovery_completed)
         self.snapshot_loaded.connect(self._on_snapshot_loaded)
+        self.event_persisted.connect(self._on_event_persisted)
+        self.event_count_loaded.connect(self._on_event_count_loaded)
         if self._session_detector is not None:
             self._session_detector.session_changed.connect(self._on_session_changed)
             self._session_detector.candidates_changed.connect(self._on_candidates_changed)
@@ -503,20 +510,12 @@ class MainWindow(QMainWindow):
         event.scope = scope
         event.is_pending = False
 
-        # Persist
-        event_id = self._storage.save_event(event)
-        event.id = event_id
-        snapshot.event_id = event_id
-        self._storage.save_snapshot(snapshot)
-        self._snapshot_cache[event_id] = snapshot
-        if self._selected_event_ref is event:
-            self._selected_event_id = event_id
-            self._detail_panel.show_event(event, snapshot)
+        # Persist off the UI thread (same reasoning as _on_frame_stutter_ended).
+        self._persist_event_async(event, snapshot)
 
         # Update UI
         self._event_log.upsert_event(event)
-        count = self._storage.event_count()
-        self._event_count_label.setText(f"已记录 {count} 个事件")
+        self._refresh_event_count_async()
         self._set_status_message(
             f"✓  卡顿结束 — {round(event.duration_seconds, 1)} 秒 — {category}"
             , force=True
@@ -1052,25 +1051,55 @@ class MainWindow(QMainWindow):
         event.scope = verdict.scope
         event.frame_summary = verdict.frame_summary
 
-        event_id = self._storage.save_event(event)
-        event.id = event_id
-        # Reuse the snapshot captured above rather than calling capture() again:
-        # the first call reset the peak tracker, so a second call would return a
-        # different, emptier snapshot than the one the verdict was derived from.
-        snapshot.event_id = event_id
-        self._storage.save_snapshot(snapshot)
-        self._snapshot_cache[event_id] = snapshot
-        if self._selected_event_ref is event:
-            self._selected_event_id = event_id
-            self._detail_panel.show_event(event, snapshot)
+        # Persist off the UI thread: SQLAlchemy session setup + commit on a
+        # database that also serves background reads used to freeze the whole
+        # window for the duration of the write, right when the user was trying
+        # to switch reports. Everything the DB needs is already in plain
+        # objects, so the worker is pure I/O.
+        self._persist_event_async(event, snapshot)
 
+        # The log row and (if selected) the report show the finalised data
+        # immediately; the id is filled in when the write lands.
         self._event_log.upsert_event(event)
-        count = self._storage.event_count()
-        self._event_count_label.setText(f"已记录 {count} 个事件")
+        self._refresh_event_count_async()
         self.statusBar().showMessage(
             f"已记录 {event.category} — 峰值 {episode.peak_frame_time_ms:.1f} ms"
         )
         self._pending_frame_event = None
+
+    def _persist_event_async(self, event: LagEvent, snapshot: LagSnapshot | None):
+        """Write event + snapshot on a daemon thread; apply ids when done."""
+
+        def _worker():
+            event_id = self._storage.save_event(event)
+            snapshot_id = None
+            if snapshot is not None:
+                snapshot.event_id = event_id
+                snapshot_id = self._storage.save_snapshot(snapshot)
+            self.event_persisted.emit(event, event_id, snapshot, snapshot_id)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(object, int, object, int)
+    def _on_event_persisted(self, event: LagEvent, event_id: int, snapshot: LagSnapshot | None, snapshot_id: int | None):
+        event.id = event_id
+        if snapshot is not None:
+            snapshot.id = snapshot_id
+            self._snapshot_cache[event_id] = snapshot
+        if self._selected_event_ref is event:
+            self._selected_event_id = event_id
+            self._detail_panel.show_event(event, snapshot)
+
+    def _refresh_event_count_async(self):
+        def _worker():
+            count = self._storage.event_count()
+            self.event_count_loaded.emit(count)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(int)
+    def _on_event_count_loaded(self, count: int):
+        self._event_count_label.setText(f"已记录 {count} 个事件")
 
     @Slot(str)
     def _on_capture_error(self, message: str):

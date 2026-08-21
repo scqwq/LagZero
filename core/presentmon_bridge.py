@@ -34,6 +34,13 @@ STARTUP_TIMEOUT_MS = 5000
 GRACEFUL_EXIT_TIMEOUT_MS = 2000
 FORCED_EXIT_TIMEOUT_MS = 1500
 METRICS_EMIT_INTERVAL_S = 0.2
+# The rolling window for the live metrics snapshot is TIME-based, not
+# frame-count-based. A 180-frame window is 0.75 s at 240 fps but NINE SECONDS
+# at 20 fps, which made the FPS / avg / P95 tiles lag a low-framerate game by
+# tens of seconds: by the time a hitch showed up in the panel it was long
+# over. Two seconds keeps the numbers responsive at any frame rate while
+# still smoothing out single-frame noise.
+METRICS_WINDOW_S = 2.0
 LIKELY_UNSUPPORTED_HIGH_PRECISION_TARGETS = {"java.exe", "javaw.exe"}
 # v2 exposes CPUBusy/CPUWait/GPUBusy/GPUWait as separate columns, which is what
 # makes CPU-vs-GPU attribution possible at all. v1 is still parsed for older
@@ -133,7 +140,10 @@ class _PresentMonParser(QObject):
         super().__init__()
         self._headers: list[str] = []
         self._stdout_buffer = ""
-        self._recent_frames: deque[FrameSample] = deque(maxlen=180)
+        # maxlen bounds the deque even if a pathological process emits frames
+        # far faster than one per millisecond; the real trimming is by age in
+        # _trim_recent_frames().
+        self._recent_frames: deque[FrameSample] = deque(maxlen=4096)
         self._last_metrics_emit_ts = 0.0
         self._malformed_line_count = 0
 
@@ -144,6 +154,17 @@ class _PresentMonParser(QObject):
         self._recent_frames.clear()
         self._last_metrics_emit_ts = 0.0
         self._malformed_line_count = 0
+
+    def _trim_recent_frames(self):
+        """Drop frames older than METRICS_WINDOW_S; O(evictions), amortised."""
+        if not self._recent_frames:
+            return
+        # FrameSample.timestamp is wall-clock (datetime.now() at parse time),
+        # so the cutoff must be wall-clock too — monotonic() is a different
+        # time base and would compare against nonsense.
+        cutoff = datetime.now().timestamp() - METRICS_WINDOW_S
+        while self._recent_frames and self._recent_frames[0].timestamp.timestamp() < cutoff:
+            self._recent_frames.popleft()
 
     @Slot(str)
     def process_chunk(self, chunk: str):
@@ -180,6 +201,7 @@ class _PresentMonParser(QObject):
             return
 
         self._recent_frames.append(sample)
+        self._trim_recent_frames()
         self.sample_parsed.emit(sample)
         now = monotonic()
         if len(self._recent_frames) == 1 or (now - self._last_metrics_emit_ts) >= METRICS_EMIT_INTERVAL_S:
