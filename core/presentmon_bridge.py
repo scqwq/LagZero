@@ -6,6 +6,7 @@ and emits parsed frame samples plus a lightweight rolling summary for the UI.
 """
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 from collections import deque
@@ -20,14 +21,72 @@ from time import monotonic
 
 from PySide6.QtCore import QObject, QProcess, QThread, QTimer, Signal, Slot
 
+from core import elevation
 from core.models import FrameMetricsSnapshot, FrameSample
 
 
 DEFAULT_PRESENTMON_DIR = Path(__file__).parent.parent / "tools" / "PresentMon"
 DEFAULT_PRESENTMON_PATH = DEFAULT_PRESENTMON_DIR / "PresentMon.exe"
 STARTUP_TIMEOUT_MS = 5000
+# PresentMon needs a moment after terminate() to call StopTrace and close its
+# real-time ETW session; killing it before that orphans the session.
+GRACEFUL_EXIT_TIMEOUT_MS = 2000
+FORCED_EXIT_TIMEOUT_MS = 1500
 METRICS_EMIT_INTERVAL_S = 0.2
 LIKELY_UNSUPPORTED_HIGH_PRECISION_TARGETS = {"java.exe", "javaw.exe"}
+
+
+class _StreamTextDecoder:
+    """
+    Stateful byte -> text decoder for PresentMon's stdout/stderr.
+
+    PresentMon writes UTF-16LE with a byte-order mark, even when its streams are
+    redirected to pipes. Two consequences drive this class:
+
+      - Decoding must be incremental. A chunk boundary can fall in the middle of
+        a UTF-16 code unit (or a surrogate pair), so decoding each chunk
+        independently corrupts characters at the seams.
+      - The encoding must be sniffed from the BOM rather than assumed. Decoding
+        UTF-16 as UTF-8 yields text with an interleaved NUL after every
+        character, which breaks CSV parsing and substring matching alike.
+
+    Falls back to UTF-8 for builds that emit no BOM.
+    """
+
+    # UTF-8's BOM is three bytes, so buffer that many before deciding.
+    _SNIFF_BYTES = 3
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._decoder = None
+        self._pending = b""
+
+    def decode(self, payload: bytes) -> str:
+        if not payload:
+            return ""
+        if self._decoder is None:
+            self._pending += payload
+            if len(self._pending) < self._SNIFF_BYTES:
+                # Not enough bytes to identify the encoding yet. A stream that
+                # never grows past this holds no decodable content anyway.
+                return ""
+            payload, self._pending = self._pending, b""
+            encoding = self._sniff_encoding(payload)
+            # "replace" keeps the stream alive on genuinely invalid bytes;
+            # incomplete trailing sequences are buffered by the decoder itself.
+            self._decoder = codecs.getincrementaldecoder(encoding)("replace")
+        return self._decoder.decode(payload)
+
+    @staticmethod
+    def _sniff_encoding(prefix: bytes) -> str:
+        # The "utf-16" codec consumes the BOM and derives endianness from it.
+        if prefix.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+            return "utf-16"
+        if prefix.startswith(codecs.BOM_UTF8):
+            return "utf-8-sig"
+        return "utf-8"
 
 
 class _PresentMonParser(QObject):
@@ -41,6 +100,7 @@ class _PresentMonParser(QObject):
         self._stdout_buffer = ""
         self._recent_frames: deque[FrameSample] = deque(maxlen=180)
         self._last_metrics_emit_ts = 0.0
+        self._malformed_line_count = 0
 
     @Slot()
     def reset_stream(self):
@@ -48,6 +108,7 @@ class _PresentMonParser(QObject):
         self._stdout_buffer = ""
         self._recent_frames.clear()
         self._last_metrics_emit_ts = 0.0
+        self._malformed_line_count = 0
 
     @Slot(str)
     def process_chunk(self, chunk: str):
@@ -59,10 +120,16 @@ class _PresentMonParser(QObject):
             line = raw_line.strip()
             if not line:
                 continue
-            self._handle_csv_line(line)
+            # A single malformed row must never propagate out of this slot: an
+            # exception here would abandon the rest of the buffered chunk and
+            # leave the stream de-synchronised for every later frame.
+            try:
+                self._handle_csv_line(line)
+            except Exception:
+                self._malformed_line_count += 1
 
     def _handle_csv_line(self, line: str):
-        row = next(csv.reader(io.StringIO(line)))
+        row = next(csv.reader(io.StringIO(line)), None)
         if not row:
             return
         if not self._headers:
@@ -175,6 +242,11 @@ class PresentMonBridge(QObject):
         self._process.finished.connect(self._on_process_finished)
         self._process.stateChanged.connect(self._on_process_state_changed)
 
+        # PresentMon emits UTF-16LE with a BOM; decoding is stateful because a
+        # pipe chunk can split a code unit. One decoder per stream.
+        self._stdout_decoder = _StreamTextDecoder()
+        self._stderr_decoder = _StreamTextDecoder()
+
         self._target_process = ""
         self._target_pid: int | None = None
         self._prefer_process_name_match = False
@@ -183,7 +255,7 @@ class PresentMonBridge(QObject):
         self._received_header = False
         self._last_error_text = ""
         self._last_status_text = "Idle"
-        self._session_name = "LagLense"
+        self._session_name = self._stable_session_name()
         self._start_count = 0
         self._auto_retry_done = False
         self._pending_restart = False
@@ -195,6 +267,7 @@ class PresentMonBridge(QObject):
         self._last_stderr_line = ""
         self._last_stderr_emit_ts = 0.0
         self._last_failure_reason = ""
+        self._last_cleanup_error = ""
         self._startup_timeout_notified = False
         self._startup_timer = QTimer(self)
         self._startup_timer.setSingleShot(True)
@@ -241,6 +314,17 @@ class PresentMonBridge(QObject):
             self.restart_capture()
         return True
 
+    @staticmethod
+    def _stable_session_name() -> str:
+        """
+        One ETW session name per LagLense process, reused for every restart.
+
+        Keeping it stable is what lets "--stop_existing_session" reclaim the
+        previous session instead of leaving it running as an orphan. The PID
+        keeps concurrent LagLense instances from fighting over one name.
+        """
+        return f"LagLense-{os.getpid()}"
+
     def target_description(self) -> str:
         if self._target_pid:
             suffix = " via name match" if self._prefer_process_name_match and self._target_process else ""
@@ -272,7 +356,12 @@ class PresentMonBridge(QObject):
             self._initial_cleanup_done = True
 
         self._start_count += 1
-        self._session_name = f"LagLense-{os.getpid()}-{self._start_count}"
+        # The session name must stay STABLE across restarts within this process.
+        # "--stop_existing_session" only matches a session of the same name, so a
+        # per-attempt suffix meant every restart orphaned the previous real-time
+        # ETW session. Those orphans then competed for the DxgKrnl trace buffers
+        # ("events were lost") and eventually exhausted the session limit (1450).
+        self._session_name = self._stable_session_name()
         args = [
             "--output_stdout",
             "--no_console_stats",
@@ -294,6 +383,10 @@ class PresentMonBridge(QObject):
         self._auto_retry_done = False
         self._pending_restart = False
         self._startup_timeout_notified = False
+        # Each PresentMon process writes a fresh BOM, so per-stream decode state
+        # must be dropped before the next one starts.
+        self._stdout_decoder.reset()
+        self._stderr_decoder.reset()
         self._parser_reset_requested.emit()
         self._process.start(str(self._resolve_executable()), args)
         self._startup_timer.start(STARTUP_TIMEOUT_MS)
@@ -306,32 +399,62 @@ class PresentMonBridge(QObject):
         self._startup_timer.stop()
         if self._process.state() == QProcess.ProcessState.NotRunning:
             return
-        self._process.kill()
         self._set_status("Stopping capture…")
+        self._terminate_process_gracefully()
 
     def restart_capture(self):
         self._pending_restart = True
         self.stop_capture()
 
+    def _terminate_process_gracefully(self) -> None:
+        """
+        Ask PresentMon to exit before forcing it.
+
+        QProcess.kill() maps to TerminateProcess on Windows, which gives
+        PresentMon no chance to run its shutdown path and call StopTrace. The
+        real-time ETW session then survives the process as an orphan. terminate()
+        posts WM_CLOSE / CTRL_BREAK first so the session is closed properly, and
+        kill() remains as the fallback for a wedged process.
+        """
+        if self._process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._process.terminate()
+        if self._process.waitForFinished(GRACEFUL_EXIT_TIMEOUT_MS):
+            return
+        # Still alive: force it, then reclaim the session name out-of-band since
+        # the orphaned session would otherwise linger until reboot.
+        self._process.kill()
+        self._process.waitForFinished(FORCED_EXIT_TIMEOUT_MS)
+        self._cleanup_named_session(self._session_name)
+
     def shutdown(self):
         self._startup_timer.stop()
-        if self._process.state() != QProcess.ProcessState.NotRunning:
-            self._process.kill()
-            self._process.waitForFinished(1500)
+        self._terminate_process_gracefully()
+        # Last line of defence: on exit, make sure this process leaves no
+        # real-time session behind even if PresentMon died without cleaning up.
+        self._cleanup_named_session(self._stable_session_name())
         self._parser_thread.quit()
         self._parser_thread.wait(2000)
 
     def cleanup_stale_sessions(self, include_active: bool = False) -> int:
+        self._last_cleanup_error = ""
         stale = self._find_stale_sessions(force_refresh=True, include_active=include_active)
-        for name in stale:
-            self._cleanup_named_session(name)
+        stopped = [name for name in stale if self._cleanup_named_session(name)]
         self._refresh_trace_sessions(force=True)
-        if stale:
-            self._last_status_text = f"Cleaned {len(stale)} stale trace session(s)"
-        else:
+        failed = len(stale) - len(stopped)
+        if not stale:
             self._last_status_text = "No stale trace sessions found"
+        elif failed:
+            # Reporting the count found as the count cleaned is what made the
+            # unelevated access-denied failure invisible.
+            self._last_status_text = (
+                f"Cleaned {len(stopped)}/{len(stale)} stale trace session(s); "
+                f"{failed} failed ({self._last_cleanup_error or 'unknown error'})"
+            )
+        else:
+            self._last_status_text = f"Cleaned {len(stopped)} stale trace session(s)"
         self._emit_diagnostics(force=True)
-        return len(stale)
+        return len(stopped)
 
     def probe_active_presents(self, duration_seconds: int = 3) -> str:
         """
@@ -378,9 +501,14 @@ class PresentMonBridge(QObject):
             if not temp_path.exists():
                 return f"Probe produced no CSV file. stderr={stderr or 'none'}"
 
-            with temp_path.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
-                reader = csv.DictReader(fh)
-                rows = list(reader)
+            # Sniff the BOM instead of assuming UTF-8. PresentMon writes UTF-16LE
+            # to its stdout/stderr pipes, and the encoding of --output_file could
+            # not be confirmed here (an unelevated probe never captures enough to
+            # produce a file), so decode the same way the live streams are
+            # decoded rather than betting on one of the two.
+            decoded = _StreamTextDecoder().decode(temp_path.read_bytes())
+            reader = csv.DictReader(io.StringIO(decoded, newline=""))
+            rows = list(reader)
 
             if not rows:
                 return f"Probe found no present events in {duration_seconds}s. stderr={stderr or 'none'}"
@@ -449,13 +577,13 @@ class PresentMonBridge(QObject):
         return f"Recovery restarted high-precision capture for {target_desc}. Waiting for frame data."
 
     def _read_stdout(self):
-        chunk = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="ignore")
+        chunk = self._stdout_decoder.decode(bytes(self._process.readAllStandardOutput()))
         if not chunk:
             return
         self._stdout_chunk_received.emit(chunk)
 
     def _read_stderr(self):
-        text = bytes(self._process.readAllStandardError()).decode("utf-8", errors="ignore").strip()
+        text = self._stderr_decoder.decode(bytes(self._process.readAllStandardError())).strip()
         if text:
             line = text.splitlines()[-1][:240]
             lowered = line.lower()
@@ -751,9 +879,10 @@ class PresentMonBridge(QObject):
     @Slot(object)
     def _pause_capture_for_probe(self, done_event):
         self._startup_timer.stop()
-        if self._process.state() != QProcess.ProcessState.NotRunning:
-            self._process.kill()
-            self._process.waitForFinished(2500)
+        # Graceful stop matters most here: the probe is about to start its own
+        # session, so leaving this one orphaned would double the buffer pressure
+        # that causes "events were lost" in the very measurement being taken.
+        self._terminate_process_gracefully()
         if hasattr(done_event, "set"):
             done_event.set()
 
@@ -783,9 +912,10 @@ class PresentMonBridge(QObject):
         top_summary = ", ".join(top_sessions) if top_sessions else "none"
         diag = (
             f"exe={self._resolve_executable().name} | session={self._session_name} | state={state}\n"
-            f"trace_total={trace_total} | likely_remaining_budget={'low' if trace_total >= 40 else 'medium' if trace_total >= 25 else 'healthy'} | top={top_summary}\n"
+            f"elevated={elevation.is_elevated()} | trace_total={trace_total} | likely_remaining_budget={'low' if trace_total >= 40 else 'medium' if trace_total >= 25 else 'healthy'} | top={top_summary}\n"
             f"target={self.target_description()} | header_seen={self._received_header} | received_frame={self._received_frame}\n"
             f"status={self._last_status_text}\n"
+            f"cleanup_error={self._last_cleanup_error or 'none'}\n"
             f"stderr={self._last_error_text or 'none'}"
         )
         now = monotonic()
@@ -802,60 +932,78 @@ class PresentMonBridge(QObject):
         current = self._session_name.lower()
         stale = []
         for name in names:
-            if not (name.startswith("LagLense-") or name == "PresentMon"):
+            # "LagLense" without the dash also catches "LagLenseProbe-<pid>": the
+            # probe cleans up after itself, but if that cleanup was denied the
+            # orphan would otherwise never be reclaimed by anything.
+            if not (name.startswith("LagLense") or name == "PresentMon"):
                 continue
             if not include_active and name.lower() == current:
                 continue
             stale.append(name)
         return stale
 
-    def _cleanup_named_session(self, session_name: str):
-        if not session_name:
-            return
-        try:
-            subprocess.run(
-                ["logman", "stop", session_name, "-ets"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except Exception:
-            pass
+    def _cleanup_named_session(self, session_name: str) -> bool:
+        """
+        Stop one real-time session, recording why it failed.
+
+        The previous version swallowed every error, so an unelevated 'logman stop'
+        (which returns access denied) looked indistinguishable from a successful
+        cleanup. Callers now get a boolean and the reason lands in diagnostics.
+        """
+        stopped, detail = elevation.stop_trace_session(session_name)
+        if not stopped:
+            self._last_cleanup_error = detail
+        return stopped
 
     def _list_trace_sessions(self) -> list[str]:
+        """
+        Enumerate running real-time ETW sessions, independent of console locale.
+
+        The previous implementation matched the literal English strings "Trace",
+        "Running" and "Data Collector Set". On a Chinese Windows install logman
+        prints 跟踪 / 正在运行 / 数据收集器集, so every line was rejected and the
+        session list came back empty — which made stale-session cleanup a no-op
+        no matter how many orphans existed.
+
+        Only two things about the layout are actually locale-stable: a dashed
+        separator follows the header, and every session row is
+        "<name>  <type>  <status>" separated by runs of 2+ spaces. Since
+        "logman query -ets" lists nothing but trace sessions, the type column
+        does not need to be inspected at all.
+        """
         try:
             result = subprocess.run(
                 ["logman", "query", "-ets"],
                 capture_output=True,
-                text=True,
                 timeout=8,
                 check=False,
+                # Bytes, not text=True: the default locale decode mangles the
+                # non-ASCII column labels and can raise on some code pages.
             )
         except Exception:
             return []
 
+        stdout = elevation.decode_console(result.stdout)
         names: list[str] = []
-        for line in result.stdout.splitlines():
-            stripped = line.rstrip()
-            if (
-                not stripped
-                or stripped.startswith("Data Collector Set")
-                or stripped.startswith("---")
-                or stripped.startswith("The command completed successfully.")
-            ):
+        past_header = False
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
                 continue
-            columns = re.split(r"\s{2,}", stripped.strip())
-            if len(columns) >= 3 and columns[-2] == "Trace":
-                name = columns[0].strip()
-                if name:
-                    names.append(name)
+            if set(stripped) <= {"-"}:
+                # The dashed rule under the header; rows start after it.
+                past_header = True
                 continue
-            match = re.match(r"^(?P<name>.+?)\s+Trace\s+Running\s*$", stripped)
-            if match:
-                name = match.group("name").strip()
-                if name:
-                    names.append(name)
+            if not past_header:
+                continue
+            columns = re.split(r"\s{2,}", stripped)
+            # Trailing chatter ("The command completed successfully.") is a
+            # single column because it has no run of 2+ spaces.
+            if len(columns) < 3:
+                continue
+            name = columns[0].strip()
+            if name:
+                names.append(name)
         return names
 
     def _refresh_trace_sessions(self, force: bool = False) -> list[str]:

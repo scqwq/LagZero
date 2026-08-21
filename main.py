@@ -16,6 +16,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, QThread, QTimer
 
+from core import elevation
 from core.collectors import SystemCollector
 from core.detection import DetectionEngine
 from core.recorder import SnapshotRecorder
@@ -30,6 +31,19 @@ from ui.main_window import MainWindow
 
 
 def main():
+    # Elevate before building anything. PresentMon is manifested asInvoker, so it
+    # inherits this process's token; without elevation it cannot reliably enable
+    # the DxgKrnl providers, cannot target processes via --process_name, and
+    # cannot stop stale real-time sessions. Done first so the replaced process
+    # never leaves a half-initialised UI or a claimed ETW session behind.
+    if not elevation.is_elevated() and not elevation.elevation_already_attempted():
+        spawned, message = elevation.relaunch_as_admin()
+        print(message)
+        if spawned:
+            # The elevated instance takes over; two instances would collide on
+            # the same ETW session name.
+            return 0
+
     # High-DPI support
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -97,8 +111,8 @@ def main():
     compat_detector_thread.wait(2000)
     session_detector.stop()
     collector.stop()
-    sys.exit(exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
