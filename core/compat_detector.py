@@ -11,6 +11,7 @@ from datetime import datetime
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from core.collectors import per_core_to_machine_share
 from core.models import CompatibilitySample, FrameStutterEpisode
 
 
@@ -18,6 +19,11 @@ RESPONSE_SPIKE_MS = 120.0
 RESPONSE_FREEZE_MS = 250.0
 CALM_TIME_TO_END_MS = 900.0
 VISUAL_FROZEN_STREAK_LIMIT = 8
+# psutil's per-process cpu_percent counts 100% per CORE, so a 32-thread
+# machine shows the target game at 300–2000% while perfectly healthy. The old
+# ≥85 (per-core) rule fired constantly on such machines; the share of the
+# whole machine is the number that actually means "the game is starving".
+CPU_PRESSURE_MACHINE_SHARE = 70.0   # % of whole machine
 
 
 class CompatibilityStutterDetector(QObject):
@@ -97,7 +103,10 @@ class CompatibilityStutterDetector(QObject):
             return True, "COMPAT_VISUAL_FREEZE"
         if sample.response_time_ms >= RESPONSE_SPIKE_MS:
             return True, "COMPAT_STALL"
-        if sample.process_cpu_percent >= 85.0 and sample.response_time_ms >= 60.0:
+        if (
+            per_core_to_machine_share(sample.process_cpu_percent) >= CPU_PRESSURE_MACHINE_SHARE
+            and sample.response_time_ms >= 60.0
+        ):
             return True, "COMPAT_CPU_PRESSURE"
         if (sample.process_read_kb_s + sample.process_write_kb_s) >= 4096.0 and sample.response_time_ms >= 60.0:
             return True, "COMPAT_IO_PRESSURE"

@@ -13,9 +13,10 @@ from PySide6.QtWidgets import QApplication
 _app = QApplication.instance() or QApplication(sys.argv)
 
 from datetime import datetime, timedelta
-from core.models import FrameStutterEpisode, LagEvent, LagSnapshot, SystemSample, ProcessSample
+from core.models import FrameSample, FrameStutterEpisode, LagEvent, LagSnapshot, SystemSample, ProcessSample, TargetProcessMetrics
 from core.detection import DetectionEngine
 from core import analyzer as analyzer_mod
+from core import collectors as collectors_mod
 from core.analyzer import CauseAnalyzer
 from ui.detail_panel import DetailPanelWidget
 
@@ -24,7 +25,19 @@ from ui.detail_panel import DetailPanelWidget
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_sample(cpu=10.0, ram=40.0, resp=10.0, processes=None, swap=0.0):
+def set_cpu_count(count: int):
+    """
+    Pin the logical-core count used by the machine-share normalisation.
+
+    Process-CPU thresholds are now expressed as a share of the whole machine,
+    so a test that leaves the real core count in place asserts different
+    things on a laptop than on a 32-thread desktop. Fixing the count makes
+    the percentages in each test mean exactly what the test says.
+    """
+    collectors_mod._cpu_count_cache = count
+
+
+def make_sample(cpu=10.0, ram=40.0, resp=10.0, processes=None, swap=0.0, target=None):
     return SystemSample(
         timestamp=datetime.now(),
         cpu_percent=cpu,
@@ -35,11 +48,16 @@ def make_sample(cpu=10.0, ram=40.0, resp=10.0, processes=None, swap=0.0):
         swap_percent=swap,
         responsiveness_ms=resp,
         top_processes=processes or [],
+        target_process=target,
     )
 
 
 def make_process(name, cpu, mem_mb=100.0, pid=1234):
     return ProcessSample(pid=pid, name=name, cpu_percent=cpu, memory_mb=mem_mb)
+
+
+def make_target(name="game.exe", cpu=200.0, pid=1234):
+    return TargetProcessMetrics(pid=pid, name=name, cpu_percent=cpu, memory_mb=8192.0)
 
 
 def make_episode(
@@ -177,6 +195,30 @@ class TestDetectionEngine:
         assert not engine._in_lag
         assert engine._consecutive_lag == 0
 
+    def test_idle_baseline_does_not_flag_normal_load(self):
+        """
+        Regression: a quiet machine learns mean=8%, σ=1, which used to put the
+        learned lag line at 10% — and then an ordinary game load (30–50%) read
+        as sustained lag. The threshold floor must keep the line at a level no
+        healthy machine sits below.
+        """
+        engine = DetectionEngine()
+        for _ in range(70):
+            engine.ingest(make_sample(cpu=8, ram=35, resp=10))
+        assert engine.baseline.is_ready
+        for _ in range(10):
+            engine.ingest(make_sample(cpu=45, ram=50, resp=14))
+        assert not engine._in_lag
+
+    def test_sustained_real_saturation_still_triggers(self):
+        """The floor must not swallow genuine 95%+ saturation."""
+        engine = DetectionEngine()
+        for _ in range(70):
+            engine.ingest(make_sample(cpu=8, ram=35, resp=10))
+        for _ in range(5):
+            engine.ingest(make_sample(cpu=97, ram=60, resp=30))
+        assert engine._in_lag
+
 
 # ---------------------------------------------------------------------------
 # CauseAnalyzer tests
@@ -191,13 +233,46 @@ class TestCauseAnalyzer:
     """
 
     def test_cpu_spike_detected(self):
+        set_cpu_count(8)
         analyzer = CauseAnalyzer()
-        proc = make_process("chrome.exe", cpu=75.0)
-        sample = make_sample(cpu=80, processes=[proc])
+        # 900% per-core on 8 threads = 112% of the machine: genuine saturation.
+        proc = make_process("chrome.exe", cpu=900.0)
+        sample = make_sample(cpu=95, processes=[proc])
         category, msg, scope = analyzer.analyze(sample, [])
         assert category == analyzer_mod.CATEGORY_CPU_BOUND
         assert "chrome.exe" in msg
         assert scope == analyzer_mod.SCOPE_LOCAL
+
+    def test_game_at_200pct_on_32_threads_is_not_a_cpu_spike(self):
+        """
+        Regression for the false positive that drove this rework: a 32-thread
+        machine running a game at 200% per-core CPU (= 6% of the machine) was
+        reported every few seconds as "game.exe is starving the system".
+        """
+        set_cpu_count(32)
+        analyzer = CauseAnalyzer()
+        proc = make_process("game.exe", cpu=200.0)
+        sample = make_sample(cpu=25, ram=50, resp=12, processes=[proc])
+        category, msg, scope = analyzer.analyze(sample, [])
+        assert category != analyzer_mod.CATEGORY_CPU_BOUND
+        assert "game.exe" not in msg or "starve" not in msg
+
+    def test_tracked_game_gets_higher_exempt_line_than_others(self):
+        set_cpu_count(8)
+        analyzer = CauseAnalyzer()
+        game = make_process("game.exe", cpu=400.0)          # 50% of machine
+        target = make_target(cpu=400.0)
+        sample = make_sample(cpu=55, processes=[game], target=target)
+        category, _, _ = analyzer.analyze(sample, [])
+        assert category != analyzer_mod.CATEGORY_CPU_BOUND
+
+        # Same share by a NON-tracked process is above the 40% line and not
+        # exempt, so it is reported.
+        other = make_process("compile.exe", cpu=400.0)
+        sample = make_sample(cpu=55, processes=[other])
+        category, msg, _ = analyzer.analyze(sample, [])
+        assert category == analyzer_mod.CATEGORY_CPU_BOUND
+        assert "compile.exe" in msg
 
     def test_ram_exhaustion_detected(self):
         analyzer = CauseAnalyzer()
@@ -213,15 +288,27 @@ class TestCauseAnalyzer:
         assert category == analyzer_mod.CATEGORY_IO_STALL
 
     def test_background_cluster_detected(self):
+        set_cpu_count(8)
         analyzer = CauseAnalyzer()
         # PIDs start at 1000: PID 0 is the kernel idle process and is now filtered
         # out of the "who is eating the CPU" ranking, so it cannot stand in for a
-        # fake background service any more.
-        procs = [make_process(f"service{i}.exe", cpu=8.0, pid=1000 + i) for i in range(7)]
-        sample = make_sample(cpu=60, processes=procs)
+        # fake background service any more. Each member must hold ≥5% of the
+        # whole machine (40% per-core on 8 threads).
+        procs = [make_process(f"service{i}.exe", cpu=60.0, pid=1000 + i) for i in range(7)]
+        sample = make_sample(cpu=90, processes=procs)
         category, msg, scope = analyzer.analyze(sample, [])
         assert category == analyzer_mod.CATEGORY_BACKGROUND_INTERFERENCE
         assert "service0.exe" in msg
+
+    def test_small_cluster_below_member_share_not_reported(self):
+        """Seven processes at 20% per-core each (2.5% of an 8-thread machine)
+        are a normal background hum, not interference."""
+        set_cpu_count(8)
+        analyzer = CauseAnalyzer()
+        procs = [make_process(f"service{i}.exe", cpu=20.0, pid=1000 + i) for i in range(7)]
+        sample = make_sample(cpu=30, processes=procs)
+        category, msg, scope = analyzer.analyze(sample, [])
+        assert category != analyzer_mod.CATEGORY_BACKGROUND_INTERFERENCE
 
     def test_fallback_returns_valid_code(self):
         analyzer = CauseAnalyzer()
@@ -275,9 +362,10 @@ class TestFrameEpisodeAnalysis:
     """
 
     def test_specific_system_verdict_wins(self):
+        set_cpu_count(8)
         analyzer = CauseAnalyzer()
-        proc = make_process("chrome.exe", cpu=75.0)
-        sample = make_sample(cpu=80, processes=[proc])
+        proc = make_process("chrome.exe", cpu=900.0)
+        sample = make_sample(cpu=95, processes=[proc])
         result = analyzer.analyze_frame_episode(make_episode(), sample, [])
         assert result.category == "CPU_BOUND"
         assert result.used_system_cause
@@ -335,11 +423,66 @@ class TestFrameEpisodeAnalysis:
         assert "slow samples" not in summary
 
     def test_frame_summary_always_populated(self):
+        set_cpu_count(8)
         analyzer = CauseAnalyzer()
-        sample = make_sample(cpu=80, processes=[make_process("chrome.exe", cpu=75.0)])
+        sample = make_sample(cpu=95, processes=[make_process("chrome.exe", cpu=900.0)])
         for peak in (sample, None):
             result = analyzer.analyze_frame_episode(make_episode(), peak, [])
             assert "180.0 ms" in result.frame_summary
+
+
+# ---------------------------------------------------------------------------
+# Frame drop clustering
+# ---------------------------------------------------------------------------
+
+def make_frame(frame_ms=8.0, displayed=True, ts_offset=0.0):
+    return FrameSample(
+        timestamp=datetime.now() + timedelta(milliseconds=ts_offset),
+        process_name="game.exe",
+        process_id=1234,
+        swap_chain="0",
+        runtime="DXGI",
+        present_mode="Hardware: Legacy Flip",
+        sync_interval=0,
+        allows_tearing=True,
+        frame_time_ms=frame_ms,
+        displayed_time_ms=frame_ms if displayed else 0.0,
+        was_displayed=displayed,
+    )
+
+
+class TestFrameDropClustering:
+    """
+    One dropped frame is a 4 ms longer gap at 240 Hz — invisible on its own.
+    Its visible consequence is caught by the display-gap thresholds; the drop
+    itself only becomes an event when frames drop as a burst.
+    """
+
+    def _detector(self):
+        from core.frame_detector import FrameStutterDetector
+        return FrameStutterDetector()
+
+    def test_single_drop_does_not_trigger(self):
+        det = self._detector()
+        for i in range(30):
+            det.ingest_frame(make_frame(ts_offset=i * 50))
+        det.ingest_frame(make_frame(displayed=False, ts_offset=30 * 50))
+        det.ingest_frame(make_frame(ts_offset=31 * 50))
+        det.ingest_frame(make_frame(ts_offset=32 * 50))
+        assert not det._active
+
+    def test_drop_burst_triggers(self):
+        det = self._detector()
+        for i in range(30):
+            det.ingest_frame(make_frame(ts_offset=i * 50))
+        # Frame 1: recent_drops=1 → no event. Frame 2: recent_drops=2 → no
+        # event. Frame 3: recent_drops=3 → event; this frame is absorbed.
+        det.ingest_frame(make_frame(displayed=False, ts_offset=30 * 50))
+        det.ingest_frame(make_frame(displayed=False, ts_offset=31 * 50))
+        assert not det._active
+        det.ingest_frame(make_frame(displayed=False, ts_offset=32 * 50))
+        assert det._active
+        assert det._dropped_frames >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +605,7 @@ if __name__ == "__main__":
         TestDetectionEngine(),
         TestCauseAnalyzer(),
         TestFrameEpisodeAnalysis(),
+        TestFrameDropClustering(),
         TestDetailPanelReport(),
         TestSigmoidScore(),
     ]

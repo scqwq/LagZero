@@ -4,6 +4,7 @@ core/collectors.py — Background QThread collectors for CPU, RAM, Processes, Re
 Each collector runs in its own thread and emits a signal every second.
 The UI and detection engine connect to these signals — fully decoupled.
 """
+import os
 import time
 import statistics
 from datetime import datetime
@@ -29,6 +30,31 @@ IDLE_PSEUDO_NAMES = frozenset({
     "system idle process",
     "idle",
 })
+
+# psutil's per-process cpu_percent is normalised to ONE core: 100% means one
+# full core, so a 32-thread machine shows a modern game at 300–2000%. Rules and
+# detectors that compare against a whole-machine threshold were firing on that
+# raw number (a game at 200% on 32 threads is 6% of the machine and perfectly
+# healthy), so every threshold now consumes the machine-share ratio instead.
+_cpu_count_cache: int | None = None
+
+
+def machine_cpu_count() -> int:
+    """Logical processor count, cached (os.cpu_count() walks syscalls each call)."""
+    global _cpu_count_cache
+    if _cpu_count_cache is None:
+        _cpu_count_cache = os.cpu_count() or 1
+    return _cpu_count_cache
+
+
+def per_core_to_machine_share(cpu_percent: float) -> float:
+    """
+    Convert a psutil per-process CPU % (100% = one core) into a share of the
+    whole machine (0–100). psutil already expresses the value in percent, so a
+    200% reading on a 32-thread machine is 200/32 = 6.25 — no extra ×100. The
+    denominator floor keeps a bogus core count from dividing by zero.
+    """
+    return cpu_percent / machine_cpu_count()
 
 
 # ---------------------------------------------------------------------------

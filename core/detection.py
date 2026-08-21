@@ -31,6 +31,15 @@ DEFAULT_CPU_THRESHOLD = 80.0       # %
 DEFAULT_RAM_THRESHOLD = 85.0       # %
 DEFAULT_RESP_THRESHOLD_MS = 50.0   # ms  (healthy is ~5–15 ms)
 
+# Learned thresholds are floored at these values. On a quiet machine the
+# baseline converges to e.g. mean=8%, σ=1, which put the "lag line" at 10% —
+# and then any ordinary load (opening the game!) read as sustained lag. Busy
+# and idle machines differ, but NO machine is healthy at 10% or 25% CPU, so
+# the floor keeps the personalisation from sliding into nonsense.
+CPU_THRESHOLD_FLOOR = 55.0         # % — below this CPU is not a problem, period
+RAM_THRESHOLD_FLOOR = 70.0         # % — same idea for memory
+RESP_THRESHOLD_FLOOR_MS = 25.0     # ms — Windows timer quantisation alone is ~15.6 ms
+
 # Weight for composite score
 WEIGHT_CPU = 0.50
 WEIGHT_RAM = 0.20
@@ -105,16 +114,24 @@ class DetectionEngine(QObject):
         bl = self._baseline
 
         # --- CPU score ---
-        cpu_thresh = bl.cpu_mean + 2 * bl.cpu_std if bl.is_ready else DEFAULT_CPU_THRESHOLD
+        cpu_thresh = (
+            max(CPU_THRESHOLD_FLOOR, bl.cpu_mean + 2 * bl.cpu_std)
+            if bl.is_ready
+            else DEFAULT_CPU_THRESHOLD
+        )
         cpu_score = self._sigmoid_score(sample.cpu_percent, cpu_thresh, steepness=0.1)
 
         # --- RAM score ---
-        ram_thresh = bl.ram_mean + 2 * bl.ram_std if bl.is_ready else DEFAULT_RAM_THRESHOLD
+        ram_thresh = (
+            max(RAM_THRESHOLD_FLOOR, bl.ram_mean + 2 * bl.ram_std)
+            if bl.is_ready
+            else DEFAULT_RAM_THRESHOLD
+        )
         ram_score = self._sigmoid_score(sample.ram_percent, ram_thresh, steepness=0.1)
 
         # --- Responsiveness score ---
         resp_thresh = (
-            bl.responsiveness_mean_ms + 3 * bl.responsiveness_std_ms
+            max(RESP_THRESHOLD_FLOOR_MS, bl.responsiveness_mean_ms + 3 * bl.responsiveness_std_ms)
             if bl.is_ready
             else DEFAULT_RESP_THRESHOLD_MS
         )
@@ -212,8 +229,11 @@ class DetectionEngine(QObject):
             stats.stdev(self._ram_samples[-BASELINE_MIN_SAMPLES:]) if count > 1 else 5.0, 1.0
         )
         self._baseline.responsiveness_mean_ms = stats.mean(self._resp_samples[-BASELINE_MIN_SAMPLES:])
+        # The std floor mirrors Windows timer quantisation (~15.6 ms tick):
+        # a floor below that just converts measurement noise into "learned
+        # precision" and lets the mean+3σ line collapse onto the mean itself.
         self._baseline.responsiveness_std_ms = max(
-            stats.stdev(self._resp_samples[-BASELINE_MIN_SAMPLES:]) if count > 1 else 5.0, 0.5
+            stats.stdev(self._resp_samples[-BASELINE_MIN_SAMPLES:]) if count > 1 else 5.0, 2.0
         )
         self._baseline.sample_count = count
         self._baseline.is_ready = count >= BASELINE_MIN_SAMPLES

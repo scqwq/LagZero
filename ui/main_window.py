@@ -50,6 +50,9 @@ ACCENT = "#58a6ff"
 COMPAT_RECOVERY_METRICS_REQUIRED = 6
 AUTO_HIGH_PRECISION_RECOVERY_INTERVAL_MS = 20000
 AUTO_HIGH_PRECISION_RECOVERY_COOLDOWN_S = 30.0
+# Tray balloons: one per category per this window. Events still land in the
+# log; only the popup is throttled.
+TRAY_NOTIFY_CATEGORY_COOLDOWN_S = 120.0
 MANUAL_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 AUTO_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 
@@ -216,6 +219,12 @@ class MainWindow(QMainWindow):
         self._last_capture_diag_ts = 0.0
         self._manual_candidate_hold_until = 0.0
         self._last_high_precision_recovery_ts = 0.0
+        # Tray-notification throttle, per category: a game that trips the same
+        # rule every few seconds used to raise a balloon each time. Minor
+        # events stay in the log; only the first of each kind pops per window.
+        self._last_tray_notify_ts: dict[str, float] = {}
+
+        self.setWindowTitle("LagLense")
 
         self.setWindowTitle("LagLense")
         self.resize(1100, 720)
@@ -513,8 +522,8 @@ class MainWindow(QMainWindow):
             , force=True
         )
 
-        # Tray notification
-        if self._tray and self._tray.isVisible():
+        # Tray notification (throttled per category — see _should_notify_tray)
+        if self._tray and self._tray.isVisible() and self._should_notify_tray(event):
             self._tray.showMessage(
                 "检测到卡顿事件",
                 f"{category}: {cause[:80]}…" if len(cause) > 80 else cause,
@@ -523,6 +532,23 @@ class MainWindow(QMainWindow):
             )
 
         self._active_event = None
+
+    def _should_notify_tray(self, event: LagEvent) -> bool:
+        """
+        One balloon per category per TRAY_NOTIFY_CATEGORY_COOLDOWN_S.
+
+        Event-flood games (compat mode tripping every few seconds, a CPU rule
+        that used to fire on per-core percentages) made the tray a wall of
+        balloons. The event log keeps everything; the balloon only needs to say
+        "this kind of thing is happening".
+        """
+        now = monotonic()
+        key = event.category or "UNKNOWN"
+        last = self._last_tray_notify_ts.get(key, 0.0)
+        if now - last < TRAY_NOTIFY_CATEGORY_COOLDOWN_S:
+            return False
+        self._last_tray_notify_ts[key] = now
+        return True
 
     @Slot(object)
     def _on_baseline_updated(self, baseline):

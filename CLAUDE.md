@@ -70,14 +70,16 @@ v1 schema 仍可解析（自动按表头识别），字段映射已修正（旧�
 **帧级（`frame_detector.py`，本轮重写）**：每帧对照学到的基线判定，四级事件 `FRAME_SPIKE < FRAME_STUTTER < FRAME_DROP < FRAME_FREEZE`（`DISPLAY_STALL` 优先级 2）。
 - 阈值 = `max(地板, mean×ratio, mean+margin, mean+Nσ)`，spike/stutter 各自的 ratio=2.0/3.5、margin=14/28ms、σ=3/5。地板只是兜底不是决定项。
 - **预热期**（基线 <120 帧未就绪）退回旧的保守绝对值 50/66/150ms。曾经直接用地板 33ms 当预热阈值，30fps 游戏每帧都被判卡顿 → 卡顿帧不进基线 → 基线永远不就绪的死循环。
-- **掉帧检测**：`was_displayed=False`（v2 `DisplayedTime==NA`）→ `FRAME_DROP`。这类卡顿帧时间完全正常，旧检测器彻底漏检。
+- **掉帧检测**：`was_displayed=False`（v2 `DisplayedTime==NA`）且近 12 帧内掉帧 ≥3 才触发 `FRAME_DROP`。这类卡顿帧时间完全正常，旧检测器彻底漏检；单帧掉帧在 240Hz 下只多 4ms 间隙、玩家无感，其可见后果由 DISPLAY_STALL 路径兜底。
 - **上屏延迟**：displayed_time 超过自身基线 2 倍 + 超过帧成本 1.5 倍或 8ms 才算独立事件 —— displayed 跟着 frame_time 涨只是帧慢的结果，不算独立发现。
 - **只学平静帧**：卡顿帧不进基线，否则连续卡顿的游戏会把自己的病态学成正常。
 - 严重度按"峰值/基线倍率"而非绝对毫秒（240Hz 玩家 30ms=丢 7 帧，30fps 玩家 30ms=正常）。
 
-**系统级（`detection.py`）**：CPU/RAM/响应性 sigmoid 评分 → 加权复合分（CPU 0.5 / RAM 0.2 / 响应 0.3）→ `0.6×加权+0.4×峰值维度` ≥ 0.45 且连续 2 个采样 → 卡顿。阈值是学到的 `mean+Nσ`（系统级基线 60 个采样就绪）。
+**系统级（`detection.py`）**：CPU/RAM/响应性 sigmoid 评分 → 加权复合分（CPU 0.5 / RAM 0.2 / 响应 0.3）→ `0.6×加权+0.4×峰值维度` ≥ 0.45 且连续 2 个采样 → 卡顿。阈值是学到的 `mean+Nσ`（系统级基线 60 个采样就绪），**且带地板**：CPU ≥55%、RAM ≥70%、响应 ≥25ms。曾经无下限 —— 空闲机器学出 mean=8%σ=1 → 阈值 10%，游戏一开全判卡顿。响应性 σ 下限 2ms（低于 Windows 定时器量化噪声的 σ 只是把测量噪声学成了"精度"）。
 
-**兼容模式（`compat_detector.py`）**：窗口挂起 / 视觉冻结连击≥8 / 响应尖峰（120ms/250ms 两级）+ CPU/IO 压力。
+**进程 CPU 口径（本轮修复的核心误报）**：psutil 的进程 `cpu_percent` 是单核归一化（100% = 1 个核）。所有进程级阈值必须经 `collectors.per_core_to_machine_share()` 转成整机占比后再比较：单进程规则 40% 整机、游戏本体豁免线 60% 整机、后台集群成员 5% 整机、兼容模式 CPU 压力 70% 整机。直接拿原始值比固定阈值会把 32 线程机器上 200%（=整机 6%）的游戏误报成"占满 CPU 导致卡顿"。
+
+**兼容模式（`compat_detector.py`）**：窗口挂起 / 视觉冻结连击≥8 / 响应尖峰（120ms/250ms 两级）+ CPU/IO 压力（CPU 已是整机占比口径）。
 
 ## 归因算法（`frame_attribution.py`，本轮新增）
 

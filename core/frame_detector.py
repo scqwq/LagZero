@@ -75,6 +75,12 @@ MIN_WINDOW_SAMPLES = 12
 CALM_TIME_TO_END_MS = 700.0
 CLUSTER_SLOW_COUNT = 3
 CLUSTER_STUTTER_COUNT = 5
+# A single dropped frame is a 4 ms longer gap at 240 Hz — invisible. Its
+# visible consequence (the previous frame staying up twice as long) is already
+# caught by the display-gap thresholds below, so the drop itself only counts as
+# an event when it comes as a burst. Was_displayed is False for every dropped
+# frame in the window, drops included.
+DROP_CLUSTER_COUNT = 3
 
 
 class FrameStutterDetector(QObject):
@@ -258,8 +264,20 @@ class FrameStutterDetector(QObject):
 
         # Submitted fine but never shown: previously invisible to this detector,
         # because frame_time_ms looks perfectly healthy on a dropped frame.
+        # One dropped frame is a normal part of present-queue life; a run of
+        # them inside a few frames is the visible "image tearing into a skip".
         if not sample.was_displayed:
-            return True, "FRAME_DROP"
+            # The window already contains this frame (ingest_frame appends
+            # before judging), so recent_drops counts it; no +1. Deques cannot
+            # be sliced, hence the list() the cluster checks also use.
+            if len(self._recent_frames) < MIN_WINDOW_SAMPLES:
+                return False, "FRAME_SPIKE"
+            recent_drops = sum(
+                1 for f in list(self._recent_frames)[-MIN_WINDOW_SAMPLES:] if not f.was_displayed
+            )
+            if recent_drops >= DROP_CLUSTER_COUNT:
+                return True, "FRAME_DROP"
+            return False, "FRAME_SPIKE"
         # A long display gap that merely tracks a slow frame is not an
         # independent finding — the frame thresholds above already reported it.
         # The display side is only its own stutter class when the screen went

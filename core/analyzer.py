@@ -14,7 +14,7 @@ register it in RULE_PRIORITY.  The engine tries them in order.
 """
 from dataclasses import dataclass
 
-from core.collectors import is_idle_pseudo_process
+from core.collectors import is_idle_pseudo_process, machine_cpu_count, per_core_to_machine_share
 from core.models import FrameStutterEpisode, SystemSample, ProcessSample
 
 CATEGORY_CPU_BOUND = "CPU_BOUND"
@@ -37,15 +37,26 @@ SCOPE_LOCAL = "LOCAL"
 SCOPE_NETWORK = "NETWORK"
 SCOPE_UNDETERMINED = "UNDETERMINED"
 
-# Thresholds used by rules
-SINGLE_PROC_CPU_THRESHOLD = 40.0    # % — a single process eating this much is suspicious
+# Thresholds used by rules. Process-CPU thresholds are expressed as a share of
+# the WHOLE machine (0–100%), not psutil's per-core scale (100% = one core):
+# 40% of the machine means 40% of every core summed, which on a 32-thread box
+# is ~13 cores' worth and genuinely a system-wide event, while the old per-core
+# reading flagged a game at 200% (6% of that same machine) as a hog.
+SINGLE_PROC_CPU_SHARE_THRESHOLD = 40.0   # % of whole machine
 RAM_EXHAUSTION_THRESHOLD = 88.0     # % RAM used
 SWAP_ACTIVE_THRESHOLD = 5.0         # % swap used
-BACKGROUND_CLUSTER_COUNT = 5        # number of processes each contributing ≥5% CPU
+BACKGROUND_CLUSTER_COUNT = 5        # processes each contributing ≥5% of the machine
+BACKGROUND_CLUSTER_MEMBER_SHARE = 5.0    # % of whole machine per member
 CPU_NORMAL_FOR_DISK = 55.0          # if CPU below this but lag detected → disk
 RESP_HIGH_THRESHOLD_MS = 40.0       # ms — above this is "high responsiveness delay"
 VRAM_PRESSURE_RATIO = 0.92
 TARGET_MEMORY_LIMIT_MIN_MB = 1024.0
+# The game itself is allowed to be the biggest CPU user — that is what games
+# do. It only becomes a "cause" when it saturates this share of the machine.
+GAME_PROC_EXEMPT_SHARE = 60.0       # % of whole machine
+# Thresholds carried on pre-normalisation snapshots in SQLite, expressed on the
+# old per-core scale for backward compatibility with stored data.
+LEGACY_SINGLE_PROC_CPU_THRESHOLD = 200.0
 
 # Verdicts that carry no actionable root cause. When the system rules land here
 # but the frame detector reached something specific (e.g. GPU_BOUND from frame
@@ -283,16 +294,28 @@ class CauseAnalyzer:
         if not candidates:
             return None
         top = candidates[0]
-        if top.cpu_percent >= SINGLE_PROC_CPU_THRESHOLD:
-            pct = round(top.cpu_percent, 1)
-            return (
-                CATEGORY_CPU_BOUND,
-                f'"{top.name}" (PID {top.pid}) was consuming {pct}% CPU, '
-                f"causing the system to become unresponsive. "
-                f"Try closing or restarting this application.",
-                SCOPE_LOCAL,
-            )
-        return None
+        top_share = per_core_to_machine_share(top.cpu_percent)
+        if top_share < SINGLE_PROC_CPU_SHARE_THRESHOLD:
+            return None
+        # The tracked game being busy is normal, not a cause. Only report it
+        # when it saturates enough of the machine to starve everything else.
+        target = sample.target_process
+        if (
+            target is not None
+            and top.pid == target.pid
+            and top_share < GAME_PROC_EXEMPT_SHARE
+        ):
+            return None
+        pct = round(top.cpu_percent, 1)
+        share = round(top_share, 1)
+        return (
+            CATEGORY_CPU_BOUND,
+            f'"{top.name}" (PID {top.pid}) was consuming {pct}% CPU '
+            f"(≈{share}% of all {machine_cpu_count()} logical cores), "
+            f"which is enough to starve the rest of the system. "
+            f"Try closing or restarting this application.",
+            SCOPE_LOCAL,
+        )
 
     def _rule_ram_exhaustion(
         self, sample: SystemSample, _pre: list[SystemSample]
@@ -330,7 +353,7 @@ class CauseAnalyzer:
             return None
         if sample.responsiveness_ms < 18.0:
             return None
-        if target is not None and target.cpu_percent >= 55.0:
+        if target is not None and per_core_to_machine_share(target.cpu_percent) >= GAME_PROC_EXEMPT_SHARE:
             return None
         if gpu is not None and gpu.local_usage_ratio >= 0.85:
             return None
@@ -349,15 +372,19 @@ class CauseAnalyzer:
     ) -> tuple[str, str, str] | None:
         """Many small background processes adding up to a lot of CPU."""
         contributors = [
-            p for p in self._real_processes(sample.top_processes) if p.cpu_percent >= 5.0
+            p
+            for p in self._real_processes(sample.top_processes)
+            if per_core_to_machine_share(p.cpu_percent) >= BACKGROUND_CLUSTER_MEMBER_SHARE
         ]
         if len(contributors) >= BACKGROUND_CLUSTER_COUNT:
             names = ", ".join(f'"{p.name}"' for p in contributors[:5])
-            total = round(sum(p.cpu_percent for p in contributors), 1)
+            total = round(
+                sum(per_core_to_machine_share(p.cpu_percent) for p in contributors), 1
+            )
             return (
                 CATEGORY_BACKGROUND_INTERFERENCE,
                 f"{len(contributors)} background processes ({names}) are each consuming CPU, "
-                f"totalling ~{total}% combined. No single villain, but the crowd is the problem. "
+                f"totalling ~{total}% of the machine combined. No single villain, but the crowd is the problem. "
                 f"Consider disabling startup applications.",
                 SCOPE_LOCAL,
             )
