@@ -79,6 +79,11 @@ class LagEvent:
     duration_seconds: float = 0.0
     snapshot_id: Optional[int] = None
     is_pending: bool = False
+    # Compact, language-neutral frame/response timing line for events that came
+    # from a stutter detector. The system snapshot has no frame data of its own,
+    # so without this the report loses "what the player saw" as soon as the cause
+    # analyzer supplies "why it happened".
+    frame_summary: str = ""
 
 
 @dataclass
@@ -137,6 +142,14 @@ class GameSessionInfo:
 
 @dataclass
 class FrameSample:
+    """
+    One presented frame.
+
+    Field names follow PresentMon's v2 metric set, which separates work from
+    waiting (CPUBusy vs CPUWait, GPUBusy vs GPUWait). The older v1 set is still
+    parsed, but its columns are mapped onto these names so that everything
+    downstream reasons about one vocabulary.
+    """
     timestamp: datetime
     process_name: str
     process_id: int
@@ -146,15 +159,47 @@ class FrameSample:
     sync_interval: int
     allows_tearing: bool
     frame_time_ms: float
+    # CPU side: time the frame's work occupied the CPU vs time spent blocked.
     cpu_busy_ms: float = 0.0
     cpu_wait_ms: float = 0.0
+    # GPU side: gpu_time is total queue occupancy, gpu_busy excludes GPU idle
+    # gaps within it, gpu_wait is the idle remainder.
     gpu_busy_ms: float = 0.0
+    gpu_wait_ms: float = 0.0
+    gpu_time_ms: float = 0.0
+    gpu_latency_ms: float = 0.0
+    # Display side. `displayed_time_ms` is the interval this frame remained on
+    # screen; `was_displayed` is False when the frame never reached the screen
+    # at all (v1 "Dropped", v2 "DisplayedTime == NA"). A dropped frame has no
+    # meaningful displayed time, so the flag must be checked before the number.
     displayed_time_ms: float = 0.0
+    display_latency_ms: float = 0.0
+    was_displayed: bool = True
+    # Animation smoothness: how far this frame's presentation drifted from where
+    # a perfectly paced frame would have landed.
+    animation_error_ms: float = 0.0
+    has_animation_error: bool = False
+    # End-to-end input latency. Frequently unavailable (PresentMon reports NA
+    # unless it can correlate an input event with the frame), hence the flag
+    # rather than a 0.0 that would read as "zero latency".
+    input_latency_ms: float = 0.0
+    click_latency_ms: float = 0.0
+    flip_delay_ms: float = 0.0
+    # Wall-clock seconds since capture start, straight from PresentMon. Used to
+    # timestamp frames by when they happened rather than when we parsed them.
+    capture_time_s: float = 0.0
+    present_flags: int = 0
+    metrics_version: str = "v2"
     raw_fields: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def has_input_latency(self) -> bool:
+        return self.input_latency_ms > 0.0
 
 
 @dataclass
 class FrameMetricsSnapshot:
+    """Rolling summary for the live data panel."""
     updated_at: datetime
     target_process: str
     process_id: int
@@ -167,6 +212,41 @@ class FrameMetricsSnapshot:
     cpu_wait_ms: float
     gpu_busy_ms: float
     present_mode: str
+    # Rolling medians are what the attribution logic reasons about; the panel
+    # only shows a couple of these, but keeping them here means the panel and
+    # the report are reading the same numbers instead of two separate estimates.
+    median_frame_time_ms: float = 0.0
+    median_cpu_busy_ms: float = 0.0
+    median_gpu_busy_ms: float = 0.0
+    gpu_wait_ms: float = 0.0
+    dropped_frame_count: int = 0
+    input_latency_ms: float = 0.0
+    metrics_version: str = "v2"
+
+
+@dataclass
+class FrameAttribution:
+    """
+    Which stage of the frame pipeline was responsible, and how sure we are.
+
+    Kept as a dataclass rather than a bare category string because the report has
+    to justify itself: "GPU_BOUND" alone is an assertion, while the evidence
+    lines plus a confidence let a player see why, and let a weak verdict be
+    recognised as weak instead of being stated with false authority.
+    """
+    category: str
+    confidence: float = 0.0
+    evidence: list[str] = field(default_factory=list)
+    # Per-stage share of the frame budget at the worst moment, 0-1.
+    cpu_share: float = 0.0
+    gpu_share: float = 0.0
+    display_share: float = 0.0
+    # Time blocked in the present path that GPU load could not account for.
+    wait_share: float = 0.0
+
+    @property
+    def is_confident(self) -> bool:
+        return self.confidence >= 0.5
 
 
 @dataclass
@@ -187,6 +267,20 @@ class FrameStutterEpisode:
     explanation: str
     category: str = ""
     scope: str = ""
+    # Baseline context: what this game normally runs at, so the report can say
+    # "30 ms against a 4 ms norm" instead of comparing against a fixed constant
+    # that means nothing to a high-refresh-rate player.
+    baseline_frame_time_ms: float = 0.0
+    stutter_threshold_ms: float = 0.0
+    # Frames that were presented but never reached the screen.
+    dropped_frame_count: int = 0
+    peak_display_gap_ms: float = 0.0
+    # Peak CPU busy is needed alongside peak CPU wait: busy means the CPU was the
+    # bottleneck, wait means it was blocked on something else.
+    peak_cpu_busy_ms: float = 0.0
+    peak_gpu_wait_ms: float = 0.0
+    peak_input_latency_ms: float = 0.0
+    attribution: Optional[FrameAttribution] = None
 
 
 @dataclass

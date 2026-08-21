@@ -10,6 +10,7 @@ import codecs
 import csv
 import io
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path
@@ -34,6 +35,40 @@ GRACEFUL_EXIT_TIMEOUT_MS = 2000
 FORCED_EXIT_TIMEOUT_MS = 1500
 METRICS_EMIT_INTERVAL_S = 0.2
 LIKELY_UNSUPPORTED_HIGH_PRECISION_TARGETS = {"java.exe", "javaw.exe"}
+# v2 exposes CPUBusy/CPUWait/GPUBusy/GPUWait as separate columns, which is what
+# makes CPU-vs-GPU attribution possible at all. v1 is still parsed for older
+# builds, but we ask for v2.
+METRICS_FLAG = "--v2_metrics"
+
+
+def _median(values: list[float]) -> float:
+    """Median without importing statistics on a per-frame hot path."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+@dataclass
+class CleanupReport:
+    """
+    Outcome of one stale-session sweep.
+
+    A bare count cannot express the case that actually matters: orphans were
+    found but "logman stop" was denied. The UI needs to tell the user to relaunch
+    elevated in that case, not report a successful cleanup of zero sessions.
+    """
+    found: int = 0
+    stopped: int = 0
+    needs_elevation: bool = False
+    detail: str = ""
+
+    @property
+    def failed(self) -> int:
+        return max(0, self.found - self.stopped)
 
 
 class _StreamTextDecoder:
@@ -153,10 +188,13 @@ class _PresentMonParser(QObject):
 
     def _build_metrics(self) -> FrameMetricsSnapshot:
         latest = self._recent_frames[-1]
-        frame_times = [s.frame_time_ms for s in self._recent_frames]
+        frames = list(self._recent_frames)
+        frame_times = [s.frame_time_ms for s in frames]
         frame_times_sorted = sorted(frame_times)
         p95_index = min(len(frame_times_sorted) - 1, max(0, int(len(frame_times_sorted) * 0.95) - 1))
         avg_frame_time = sum(frame_times) / len(frame_times)
+        # FPS from the average frame time, not from 1/median: a window with one
+        # 200 ms hitch should show the FPS the player actually felt.
         fps = 1000.0 / avg_frame_time if avg_frame_time > 0 else 0.0
         return FrameMetricsSnapshot(
             updated_at=datetime.now(),
@@ -171,46 +209,135 @@ class _PresentMonParser(QObject):
             cpu_wait_ms=latest.cpu_wait_ms,
             gpu_busy_ms=latest.gpu_busy_ms,
             present_mode=latest.present_mode,
+            median_frame_time_ms=_median(frame_times),
+            median_cpu_busy_ms=_median([s.cpu_busy_ms for s in frames]),
+            median_gpu_busy_ms=_median([s.gpu_busy_ms for s in frames]),
+            gpu_wait_ms=latest.gpu_wait_ms,
+            dropped_frame_count=sum(1 for s in frames if not s.was_displayed),
+            input_latency_ms=latest.input_latency_ms,
+            metrics_version=latest.metrics_version,
         )
 
     @staticmethod
     def _parse_sample(data: dict[str, str]) -> FrameSample | None:
-        process_name = data.get("Application", "")
-        process_id = _PresentMonParser._to_int(data.get("ProcessID"))
-        frame_time_ms = _PresentMonParser._to_float(data.get("msBetweenPresents")) or _PresentMonParser._to_float(data.get("FrameTime"))
+        """
+        Build a FrameSample from one CSV row, in either metric vocabulary.
+
+        The v1 mapping used to be transposed: "CPU busy" read msInPresentAPI
+        (time inside the Present call) and "CPU wait" read msUntilRenderComplete
+        (time until the GPU finished). Measured side by side against v2 on the
+        same machine, the old cpu_wait ran ~5x too high and cpu_busy ~5x too low,
+        which silently inverted every CPU-vs-GPU verdict built on top of them.
+        v2 exposes CPUBusy/CPUWait/GPUBusy/GPUWait directly, so it is preferred;
+        v1 is still mapped as closely as its columns allow for older builds.
+        """
+        to_f = _PresentMonParser._to_float
+        opt_f = _PresentMonParser._to_optional_float
+        is_v2 = "FrameTime" in data or "CPUBusy" in data
+
+        frame_time_ms = to_f(data.get("FrameTime")) if is_v2 else to_f(data.get("msBetweenPresents"))
         if frame_time_ms <= 0:
+            # Also covers rows where the column was NA: a frame with no duration
+            # carries no pacing information and would divide into the averages.
             return None
 
+        if is_v2:
+            displayed_time = opt_f(data.get("DisplayedTime"))
+            animation_error = opt_f(data.get("AnimationError"))
+            return FrameSample(
+                timestamp=datetime.now(),
+                process_name=data.get("Application", ""),
+                process_id=_PresentMonParser._to_int(data.get("ProcessID")),
+                swap_chain=data.get("SwapChainAddress", ""),
+                runtime=data.get("PresentRuntime", ""),
+                present_mode=data.get("PresentMode", ""),
+                sync_interval=_PresentMonParser._to_int(data.get("SyncInterval")),
+                allows_tearing=_PresentMonParser._to_bool(data.get("AllowsTearing")),
+                frame_time_ms=frame_time_ms,
+                cpu_busy_ms=to_f(data.get("CPUBusy")),
+                cpu_wait_ms=to_f(data.get("CPUWait")),
+                gpu_busy_ms=to_f(data.get("GPUBusy")),
+                gpu_wait_ms=to_f(data.get("GPUWait")),
+                gpu_time_ms=to_f(data.get("GPUTime")),
+                gpu_latency_ms=to_f(data.get("GPULatency")),
+                # DisplayedTime is NA exactly when the frame never reached the
+                # screen. Reading that as 0.0 would have turned a dropped frame
+                # into a frame "displayed for zero milliseconds" and hidden the
+                # entire not-displayed stutter class.
+                displayed_time_ms=displayed_time if displayed_time is not None else 0.0,
+                display_latency_ms=to_f(data.get("DisplayLatency")),
+                was_displayed=displayed_time is not None,
+                animation_error_ms=animation_error if animation_error is not None else 0.0,
+                has_animation_error=animation_error is not None,
+                input_latency_ms=to_f(data.get("AllInputToPhotonLatency")),
+                click_latency_ms=to_f(data.get("ClickToPhotonLatency")),
+                flip_delay_ms=to_f(data.get("MsFlipDelay")),
+                capture_time_s=to_f(data.get("CPUStartTime")),
+                present_flags=_PresentMonParser._to_int(data.get("PresentFlags")),
+                metrics_version="v2",
+                raw_fields=data,
+            )
+
+        # --- v1 ---
+        # v1 has no CPUBusy/CPUWait split. msInPresentAPI is the closest thing to
+        # CPU-side work for the present, and msUntilRenderComplete is genuinely a
+        # wait, so they map to busy/wait respectively rather than being swapped.
+        dropped = _PresentMonParser._to_bool(data.get("Dropped"))
+        display_change = to_f(data.get("msBetweenDisplayChange"))
         return FrameSample(
             timestamp=datetime.now(),
-            process_name=process_name,
-            process_id=process_id,
+            process_name=data.get("Application", ""),
+            process_id=_PresentMonParser._to_int(data.get("ProcessID")),
             swap_chain=data.get("SwapChainAddress", ""),
             runtime=data.get("Runtime", ""),
             present_mode=data.get("PresentMode", ""),
             sync_interval=_PresentMonParser._to_int(data.get("SyncInterval")),
             allows_tearing=_PresentMonParser._to_bool(data.get("AllowsTearing")),
             frame_time_ms=frame_time_ms,
-            cpu_busy_ms=_PresentMonParser._to_float(data.get("msInPresentAPI")),
-            cpu_wait_ms=_PresentMonParser._to_float(data.get("msUntilRenderComplete")),
-            gpu_busy_ms=_PresentMonParser._to_float(data.get("msGPUActive")),
-            displayed_time_ms=_PresentMonParser._to_float(data.get("msUntilDisplayed")),
+            cpu_busy_ms=to_f(data.get("msInPresentAPI")),
+            cpu_wait_ms=to_f(data.get("msUntilRenderComplete")),
+            gpu_busy_ms=to_f(data.get("msGPUActive")),
+            gpu_time_ms=to_f(data.get("msGPUActive")),
+            gpu_latency_ms=to_f(data.get("msUntilRenderStart")),
+            # v1 states dropped frames outright, and reports the display-change
+            # interval instead of a per-frame displayed duration.
+            displayed_time_ms=0.0 if dropped else display_change,
+            display_latency_ms=to_f(data.get("msUntilDisplayed")),
+            was_displayed=not dropped,
+            input_latency_ms=to_f(data.get("msSinceInput")),
+            flip_delay_ms=to_f(data.get("msFlipDelay")),
+            capture_time_s=to_f(data.get("TimeInSeconds")),
+            present_flags=_PresentMonParser._to_int(data.get("PresentFlags")),
+            metrics_version="v1",
             raw_fields=data,
         )
 
     @staticmethod
-    def _to_float(value: str | None) -> float:
+    def _to_optional_float(value: str | None) -> float | None:
+        """
+        None for PresentMon's "NA", a float otherwise.
+
+        PresentMon writes the literal string NA for metrics it could not compute
+        for a given frame. Collapsing that to 0.0 is what would let the report
+        claim a measurement that was never taken.
+        """
+        text = (value or "").strip()
+        if not text or text.upper() == "NA":
+            return None
         try:
-            return float(value or 0.0)
+            return float(text)
         except ValueError:
-            return 0.0
+            return None
+
+    @staticmethod
+    def _to_float(value: str | None) -> float:
+        parsed = _PresentMonParser._to_optional_float(value)
+        return parsed if parsed is not None else 0.0
 
     @staticmethod
     def _to_int(value: str | None) -> int:
-        try:
-            return int(float(value or 0))
-        except ValueError:
-            return 0
+        parsed = _PresentMonParser._to_optional_float(value)
+        return int(parsed) if parsed is not None else 0
 
     @staticmethod
     def _to_bool(value: str | None) -> bool:
@@ -268,6 +395,7 @@ class PresentMonBridge(QObject):
         self._last_stderr_emit_ts = 0.0
         self._last_failure_reason = ""
         self._last_cleanup_error = ""
+        self._last_cleanup_summary = CleanupReport()
         self._startup_timeout_notified = False
         self._startup_timer = QTimer(self)
         self._startup_timer.setSingleShot(True)
@@ -365,7 +493,7 @@ class PresentMonBridge(QObject):
         args = [
             "--output_stdout",
             "--no_console_stats",
-            "--v1_metrics",
+            METRICS_FLAG,
             "--stop_existing_session",
             "--terminate_on_proc_exit",
             "--session_name",
@@ -442,11 +570,19 @@ class PresentMonBridge(QObject):
         stopped = [name for name in stale if self._cleanup_named_session(name)]
         self._refresh_trace_sessions(force=True)
         failed = len(stale) - len(stopped)
+        # Recorded separately from the count so callers can tell "found nothing"
+        # apart from "found orphans but was not allowed to stop them" — the two
+        # were indistinguishable while this returned len(stale) unconditionally.
+        self._last_cleanup_summary = CleanupReport(
+            found=len(stale),
+            stopped=len(stopped),
+            needs_elevation="denied" in (self._last_cleanup_error or "").lower()
+            or "拒绝访问" in (self._last_cleanup_error or ""),
+            detail=self._last_cleanup_error,
+        )
         if not stale:
             self._last_status_text = "No stale trace sessions found"
         elif failed:
-            # Reporting the count found as the count cleaned is what made the
-            # unelevated access-denied failure invisible.
             self._last_status_text = (
                 f"Cleaned {len(stopped)}/{len(stale)} stale trace session(s); "
                 f"{failed} failed ({self._last_cleanup_error or 'unknown error'})"
@@ -455,6 +591,10 @@ class PresentMonBridge(QObject):
             self._last_status_text = f"Cleaned {len(stopped)} stale trace session(s)"
         self._emit_diagnostics(force=True)
         return len(stopped)
+
+    def last_cleanup_report(self) -> CleanupReport:
+        """The outcome of the most recent cleanup, for UI reporting."""
+        return self._last_cleanup_summary
 
     def probe_active_presents(self, duration_seconds: int = 3) -> str:
         """
@@ -476,7 +616,7 @@ class PresentMonBridge(QObject):
             cmd = [
                 str(self._resolve_executable()),
                 "--output_file", str(temp_path),
-                "--v1_metrics",
+                METRICS_FLAG,
                 "--no_console_stats",
                 "--stop_existing_session",
                 "--session_name", session_name,

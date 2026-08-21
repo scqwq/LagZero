@@ -2,9 +2,21 @@
 core/frame_detector.py — Frame-time based stutter detector.
 
 Consumes FrameSample items from PresentMon and raises player-visible frame
-events such as spikes, stutters, and freezes. This detector is intentionally
-game-centric: frame pacing is the primary signal, while CPU/GPU wait hints are
-captured to support later root-cause analysis.
+events such as spikes, stutters, and freezes.
+
+Thresholds are learned, not fixed. The previous version compared every frame
+against 50/66/150 ms, which meant a 240 Hz player whose frame time jumped from
+4 ms to 30 ms — a very visible hitch — was never flagged, while a 30 fps game
+sat permanently near the spike line. Each stage now carries a WelfordBaseline of
+what it normally costs in this session, and a frame is judged against that norm
+plus a perceptibility floor, so the detector adapts to the game's own frame rate
+without firing on ordinary jitter.
+
+Two signals are tracked separately:
+  frame time    — how long the game took to produce and submit the frame.
+  display gap   — how long the screen actually went without updating. A frame can
+                  be submitted on time and still never reach the screen, which is
+                  a stutter the player sees and frame time alone cannot show.
 """
 from __future__ import annotations
 
@@ -13,15 +25,35 @@ from datetime import datetime
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from core.baseline import WelfordBaseline
+from core.frame_attribution import StageReading, attribute_stutter
 from core.models import FrameSample, FrameStutterEpisode
 
+# Floors keep the detector honest about human perception. On a perfectly steady
+# capture the standard deviation approaches zero, and a pure mean+Nσ rule would
+# then call sub-millisecond jitter a stutter.
+SPIKE_FLOOR_MS = 20.0
+STUTTER_FLOOR_MS = 33.0
+FREEZE_FLOOR_MS = 150.0
+DISPLAY_FLOOR_MS = 22.0
 
-SPIKE_FRAME_MS = 50.0
-STUTTER_FRAME_MS = 66.0
-FREEZE_FRAME_MS = 150.0
-P95_BAD_FRAME_MS = 33.0
+# Additive margins are what make the thresholds work at both ends of the refresh
+# range: 4 ms + 14 ms flags a 5x hitch at 240 Hz, 33 ms + 14 ms does not flag
+# ordinary variance at 30 fps.
+SPIKE_MARGIN_MS = 14.0
+STUTTER_MARGIN_MS = 28.0
+FREEZE_MARGIN_MS = 120.0
+DISPLAY_MARGIN_MS = 14.0
+
+SPIKE_SIGMAS = 3.0
+STUTTER_SIGMAS = 5.0
+DISPLAY_SIGMAS = 4.0
+
+BASELINE_MIN_FRAMES = 120
 MIN_WINDOW_SAMPLES = 12
 CALM_TIME_TO_END_MS = 700.0
+CLUSTER_SLOW_COUNT = 3
+CLUSTER_STUTTER_COUNT = 5
 
 
 class FrameStutterDetector(QObject):
@@ -35,32 +67,37 @@ class FrameStutterDetector(QObject):
         self._active = False
         self._started_at: datetime | None = None
         self._target_process = ""
-        self._peak_frame_time = 0.0
-        self._peak_cpu_wait = 0.0
-        self._peak_gpu_busy = 0.0
-        self._slow_frame_count = 0
-        self._freeze_frame_count = 0
-        self._peak_kind = "FRAME_SPIKE"
-        self._calm_ms = 0.0
         self._present_mode = ""
+        # One baseline per stage. Attribution compares a stage's peak against its
+        # own norm, so each needs its own accumulator rather than a shared one.
+        self._frame_base = WelfordBaseline(min_samples=BASELINE_MIN_FRAMES)
+        self._cpu_busy_base = WelfordBaseline(min_samples=BASELINE_MIN_FRAMES)
+        self._cpu_wait_base = WelfordBaseline(min_samples=BASELINE_MIN_FRAMES)
+        self._gpu_busy_base = WelfordBaseline(min_samples=BASELINE_MIN_FRAMES)
+        self._display_base = WelfordBaseline(min_samples=BASELINE_MIN_FRAMES)
+        self._reset_episode_state()
+
+    # ------------------------------------------------------------------
+    # Ingest
+    # ------------------------------------------------------------------
 
     @Slot(object)
     def ingest_frame(self, sample: FrameSample):
         self._recent_frames.append(sample)
         self._target_process = sample.process_name or self._target_process
         self._present_mode = sample.present_mode or self._present_mode
+        if sample.metrics_version:
+            self._metrics_version = sample.metrics_version
 
         triggered, event_kind = self._is_stutter(sample)
-        if triggered:
-            self._calm_ms = 0.0
-            self._peak_frame_time = max(self._peak_frame_time, sample.frame_time_ms)
-            self._peak_cpu_wait = max(self._peak_cpu_wait, sample.cpu_wait_ms)
-            self._peak_gpu_busy = max(self._peak_gpu_busy, sample.gpu_busy_ms)
-            self._slow_frame_count += 1 if sample.frame_time_ms >= SPIKE_FRAME_MS else 0
-            self._freeze_frame_count += 1 if sample.frame_time_ms >= FREEZE_FRAME_MS else 0
-            if self._event_priority(event_kind) > self._event_priority(self._peak_kind):
-                self._peak_kind = event_kind
+        # Only calm frames train the baseline. Learning from the stutter itself
+        # would raise the bar every time the game misbehaved, and the detector
+        # would gradually stop reporting a game that stutters constantly.
+        if not triggered:
+            self._learn(sample)
 
+        if triggered:
+            self._absorb(sample, event_kind)
             if not self._active:
                 self._active = True
                 self._started_at = sample.timestamp
@@ -80,6 +117,134 @@ class FrameStutterDetector(QObject):
         self._recent_frames.clear()
         self._target_process = ""
         self._present_mode = ""
+        # A different game (or a different scene after a long gap) has nothing to
+        # do with the old norm, so the learned baselines go with it.
+        for base in self._baselines():
+            base.reset()
+
+    def _baselines(self) -> tuple[WelfordBaseline, ...]:
+        return (
+            self._frame_base,
+            self._cpu_busy_base,
+            self._cpu_wait_base,
+            self._gpu_busy_base,
+            self._display_base,
+        )
+
+    def _learn(self, sample: FrameSample):
+        self._frame_base.add(sample.frame_time_ms)
+        self._cpu_busy_base.add(sample.cpu_busy_ms)
+        self._cpu_wait_base.add(sample.cpu_wait_ms)
+        self._gpu_busy_base.add(sample.gpu_busy_ms)
+        if sample.was_displayed:
+            self._display_base.add(sample.displayed_time_ms)
+
+    def _absorb(self, sample: FrameSample, event_kind: str):
+        """Fold one bad frame into the running peaks for the current episode."""
+        self._calm_ms = 0.0
+        self._peak_frame_time = max(self._peak_frame_time, sample.frame_time_ms)
+        self._peak_cpu_busy = max(self._peak_cpu_busy, sample.cpu_busy_ms)
+        self._peak_cpu_wait = max(self._peak_cpu_wait, sample.cpu_wait_ms)
+        self._peak_gpu_busy = max(self._peak_gpu_busy, sample.gpu_busy_ms)
+        self._peak_gpu_wait = max(self._peak_gpu_wait, sample.gpu_wait_ms)
+        self._peak_input_latency = max(self._peak_input_latency, sample.input_latency_ms)
+        self._episode_frames += 1
+        if sample.was_displayed:
+            self._peak_display_gap = max(self._peak_display_gap, sample.displayed_time_ms)
+        else:
+            self._dropped_frames += 1
+        if sample.frame_time_ms >= self._spike_threshold():
+            self._slow_frame_count += 1
+        if sample.frame_time_ms >= self._freeze_threshold():
+            self._freeze_frame_count += 1
+        if self._event_priority(event_kind) > self._event_priority(self._peak_kind):
+            self._peak_kind = event_kind
+
+    # ------------------------------------------------------------------
+    # Thresholds
+    # ------------------------------------------------------------------
+
+    def _spike_threshold(self) -> float:
+        return self._threshold(self._frame_base, SPIKE_SIGMAS, SPIKE_MARGIN_MS, SPIKE_FLOOR_MS)
+
+    def _stutter_threshold(self) -> float:
+        return self._threshold(self._frame_base, STUTTER_SIGMAS, STUTTER_MARGIN_MS, STUTTER_FLOOR_MS)
+
+    def _freeze_threshold(self) -> float:
+        # A freeze is absolute: 150 ms of nothing is a freeze in any game. The
+        # baseline only ever raises this, never lowers it.
+        if not self._frame_base.is_ready:
+            return FREEZE_FLOOR_MS
+        return max(FREEZE_FLOOR_MS, self._frame_base.mean + FREEZE_MARGIN_MS)
+
+    def _display_threshold(self) -> float:
+        return self._threshold(
+            self._display_base, DISPLAY_SIGMAS, DISPLAY_MARGIN_MS, DISPLAY_FLOOR_MS
+        )
+
+    @staticmethod
+    def _threshold(base: WelfordBaseline, sigmas: float, margin: float, floor: float) -> float:
+        """
+        max(floor, mean + margin, mean + sigmas*std).
+
+        The margin term is what covers a steady high-refresh capture, where std is
+        tiny and mean+Nσ would sit only fractions of a millisecond above normal.
+        The sigma term covers a naturally jittery game, where a fixed margin would
+        fire constantly.
+        """
+        if not base.is_ready or base.mean <= 0.0:
+            return floor
+        return max(floor, base.mean + margin, base.mean + sigmas * base.std)
+
+    def _is_stutter(self, sample: FrameSample) -> tuple[bool, str]:
+        frame_ms = sample.frame_time_ms
+        if frame_ms >= self._freeze_threshold():
+            return True, "FRAME_FREEZE"
+        if frame_ms >= self._stutter_threshold():
+            return True, "FRAME_STUTTER"
+
+        # Submitted fine but never shown: previously invisible to this detector,
+        # because frame_time_ms looks perfectly healthy on a dropped frame.
+        if not sample.was_displayed:
+            return True, "FRAME_DROP"
+        if sample.displayed_time_ms >= self._display_threshold():
+            return True, "DISPLAY_STALL"
+
+        spike_threshold = self._spike_threshold()
+        if len(self._recent_frames) < MIN_WINDOW_SAMPLES:
+            return frame_ms >= spike_threshold, "FRAME_SPIKE"
+
+        # A cluster of individually-tolerable slow frames is what a player reads
+        # as "the game is choppy", so it counts even when no single frame crosses
+        # the stutter line.
+        recent = list(self._recent_frames)[-MIN_WINDOW_SAMPLES:]
+        slow_count = sum(1 for f in recent if f.frame_time_ms >= spike_threshold)
+        if frame_ms >= spike_threshold or slow_count >= CLUSTER_SLOW_COUNT:
+            if slow_count >= CLUSTER_STUTTER_COUNT:
+                return True, "FRAME_STUTTER"
+            if frame_ms >= spike_threshold or slow_count >= CLUSTER_SLOW_COUNT:
+                return True, "FRAME_SPIKE"
+        return False, "FRAME_SPIKE"
+
+    # ------------------------------------------------------------------
+    # Episode assembly
+    # ------------------------------------------------------------------
+
+    def _reset_episode_state(self):
+        self._peak_frame_time = 0.0
+        self._peak_cpu_busy = 0.0
+        self._peak_cpu_wait = 0.0
+        self._peak_gpu_busy = 0.0
+        self._peak_gpu_wait = 0.0
+        self._peak_display_gap = 0.0
+        self._peak_input_latency = 0.0
+        self._slow_frame_count = 0
+        self._freeze_frame_count = 0
+        self._dropped_frames = 0
+        self._episode_frames = 0
+        self._peak_kind = "FRAME_SPIKE"
+        self._calm_ms = 0.0
+        self._metrics_version = getattr(self, "_metrics_version", "v2")
 
     def _finish_episode(self, ended_at: datetime):
         episode = self._build_episode(ended_at)
@@ -90,13 +255,7 @@ class FrameStutterDetector(QObject):
             )
         self._active = False
         self._started_at = None
-        self._peak_frame_time = 0.0
-        self._peak_cpu_wait = 0.0
-        self._peak_gpu_busy = 0.0
-        self._slow_frame_count = 0
-        self._freeze_frame_count = 0
-        self._peak_kind = "FRAME_SPIKE"
-        self._calm_ms = 0.0
+        self._reset_episode_state()
 
     def _build_episode(self, ended_at: datetime) -> FrameStutterEpisode | None:
         if not self._started_at or not self._recent_frames:
@@ -104,13 +263,12 @@ class FrameStutterDetector(QObject):
         relevant = [f for f in self._recent_frames if f.timestamp >= self._started_at]
         if not relevant:
             relevant = list(self._recent_frames)
-        frame_times = [f.frame_time_ms for f in relevant]
-        frame_times_sorted = sorted(frame_times)
-        p95_idx = min(len(frame_times_sorted) - 1, max(0, int(len(frame_times_sorted) * 0.95) - 1))
+        frame_times = sorted(f.frame_time_ms for f in relevant)
+        p95_idx = min(len(frame_times) - 1, max(0, int(len(frame_times) * 0.95) - 1))
         avg_frame = sum(frame_times) / len(frame_times)
-        p95_frame = frame_times_sorted[p95_idx]
-        severity = min(1.0, max(self._peak_frame_time / 200.0, p95_frame / 80.0))
-        explanation = self._build_explanation(avg_frame, p95_frame)
+        p95_frame = frame_times[p95_idx]
+
+        attribution = self._attribute()
         return FrameStutterEpisode(
             started_at=self._started_at,
             ended_at=ended_at,
@@ -124,51 +282,104 @@ class FrameStutterDetector(QObject):
             peak_cpu_wait_ms=self._peak_cpu_wait,
             peak_gpu_busy_ms=self._peak_gpu_busy,
             present_mode=self._present_mode,
-            severity=severity,
-            explanation=explanation,
+            severity=self._severity(p95_frame),
+            explanation=self._build_explanation(avg_frame, p95_frame, attribution),
+            category=attribution.category if attribution.is_confident else "",
+            scope="LOCAL" if attribution.is_confident else "",
+            baseline_frame_time_ms=self._frame_base.mean,
+            stutter_threshold_ms=self._stutter_threshold(),
+            dropped_frame_count=self._dropped_frames,
+            peak_display_gap_ms=self._peak_display_gap,
+            peak_cpu_busy_ms=self._peak_cpu_busy,
+            peak_gpu_wait_ms=self._peak_gpu_wait,
+            peak_input_latency_ms=self._peak_input_latency,
+            attribution=attribution,
         )
 
-    def _build_explanation(self, avg_frame: float, p95_frame: float) -> str:
-        hint = "Frame pacing was unstable."
-        if self._peak_frame_time >= FREEZE_FRAME_MS:
-            hint = "A visible freeze occurred."
-        if self._peak_cpu_wait >= 20.0 and self._peak_cpu_wait > self._peak_gpu_busy:
-            cause_hint = "The frame queue spent more time waiting on the CPU/render thread side."
-        elif self._peak_gpu_busy >= 12.0 and self._peak_gpu_busy >= self._peak_cpu_wait:
-            cause_hint = "GPU-side rendering pressure was stronger than CPU wait."
+    def _severity(self, p95_frame: float) -> float:
+        """
+        How bad this was, relative to what this game normally runs at.
+
+        Absolute milliseconds cannot express severity across refresh rates: a
+        200 ms peak scores 1.0 at 30 fps and at 240 Hz, even though the second
+        player lost 50 frames and the first lost 6. Falls back to the old
+        absolute scale until the baseline is ready.
+        """
+        base = self._frame_base.mean
+        if self._frame_base.is_ready and base > 0.0:
+            ratio = max(self._peak_frame_time / base, p95_frame / base)
+            severity = min(1.0, (ratio - 1.0) / 9.0)
         else:
-            cause_hint = "No dominant CPU-wait or GPU-busy spike stood out yet."
-        return (
-            f"{hint} Peak frame time reached {self._peak_frame_time:.1f} ms, "
-            f"average frame time was {avg_frame:.1f} ms, P95 was {p95_frame:.1f} ms, "
-            f"slow frames counted: {self._slow_frame_count}, freeze frames counted: {self._freeze_frame_count}. "
-            f"Peak CPU wait was {self._peak_cpu_wait:.1f} ms, peak GPU busy was {self._peak_gpu_busy:.1f} ms, "
-            f"present mode: {self._present_mode or 'unknown'}. {cause_hint}"
+            severity = min(1.0, max(self._peak_frame_time / 200.0, p95_frame / 80.0))
+        if self._dropped_frames and self._episode_frames:
+            severity = max(severity, min(1.0, self._dropped_frames / self._episode_frames))
+        return round(max(0.05, severity), 3)
+
+    def _attribute(self):
+        """Run the stage-split attribution over this episode's peaks."""
+        dropped_ratio = (
+            self._dropped_frames / self._episode_frames if self._episode_frames else 0.0
+        )
+        # Compatibility mode and v1 captures without a CPU/GPU split cannot be
+        # attributed; saying so beats guessing from absent numbers.
+        has_breakdown = self._present_mode != "compatibility" and any(
+            (self._peak_cpu_busy, self._peak_cpu_wait, self._peak_gpu_busy)
+        )
+        return attribute_stutter(
+            frame=StageReading(self._peak_frame_time, self._frame_base.mean),
+            cpu_busy=StageReading(self._peak_cpu_busy, self._cpu_busy_base.mean),
+            cpu_wait=StageReading(self._peak_cpu_wait, self._cpu_wait_base.mean),
+            gpu_busy=StageReading(self._peak_gpu_busy, self._gpu_busy_base.mean),
+            display=StageReading(self._peak_display_gap, self._display_base.mean),
+            dropped_ratio=dropped_ratio,
+            baseline_ready=self._frame_base.is_ready,
+            has_frame_breakdown=has_breakdown,
         )
 
-    def _is_stutter(self, sample: FrameSample) -> tuple[bool, str]:
-        if sample.frame_time_ms >= FREEZE_FRAME_MS:
-            return True, "FRAME_FREEZE"
-        if sample.frame_time_ms >= STUTTER_FRAME_MS:
-            return True, "FRAME_STUTTER"
+    def _build_explanation(self, avg_frame: float, p95_frame: float, attribution) -> str:
+        """
+        One paragraph: what the player saw, then why.
 
-        if len(self._recent_frames) < MIN_WINDOW_SAMPLES:
-            return sample.frame_time_ms >= SPIKE_FRAME_MS, "FRAME_SPIKE"
+        Kept deliberately compact — the report layer adds its own formatting, and
+        the attribution's evidence lines already carry the per-stage detail, so
+        repeating every peak here would only pad the text.
+        """
+        if self._peak_frame_time >= self._freeze_threshold():
+            headline = "A visible freeze occurred."
+        elif self._dropped_frames:
+            headline = "Frames were submitted but never reached the screen."
+        else:
+            headline = "Frame pacing was unstable."
 
-        recent = list(self._recent_frames)[-MIN_WINDOW_SAMPLES:]
-        frame_times = [f.frame_time_ms for f in recent]
-        slow_count = sum(1 for ft in frame_times if ft >= SPIKE_FRAME_MS)
-        p95 = sorted(frame_times)[max(0, int(len(frame_times) * 0.95) - 1)]
+        baseline_note = ""
+        if self._frame_base.is_ready and self._frame_base.mean > 0.0:
+            baseline_note = (
+                f" Normal for this session is {self._frame_base.mean:.1f} ms, "
+                f"so the stutter line sat at {self._stutter_threshold():.1f} ms."
+            )
 
-        if slow_count >= 3 or p95 >= P95_BAD_FRAME_MS:
-            event_kind = "FRAME_STUTTER" if p95 >= STUTTER_FRAME_MS or slow_count >= 5 else "FRAME_SPIKE"
-            return True, event_kind
-        return False, "FRAME_SPIKE"
+        drop_note = ""
+        if self._dropped_frames:
+            drop_note = f" {self._dropped_frames} frame(s) were dropped before display."
+
+        evidence = " ".join(attribution.evidence[1:]) if len(attribution.evidence) > 1 else ""
+        if not evidence:
+            evidence = attribution.evidence[0] if attribution.evidence else ""
+
+        return (
+            f"{headline} Peak frame time reached {self._peak_frame_time:.1f} ms, "
+            f"average frame time was {avg_frame:.1f} ms, P95 was {p95_frame:.1f} ms, "
+            f"slow frames counted: {self._slow_frame_count}, "
+            f"freeze frames counted: {self._freeze_frame_count}."
+            f"{baseline_note}{drop_note} {evidence}"
+        ).strip()
 
     @staticmethod
     def _event_priority(kind: str) -> int:
         return {
             "FRAME_SPIKE": 1,
-            "FRAME_STUTTER": 2,
-            "FRAME_FREEZE": 3,
+            "DISPLAY_STALL": 2,
+            "FRAME_STUTTER": 3,
+            "FRAME_DROP": 4,
+            "FRAME_FREEZE": 5,
         }.get(kind, 0)

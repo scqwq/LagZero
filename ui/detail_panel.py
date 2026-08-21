@@ -3,6 +3,8 @@ ui/detail_panel.py — Right panel shown when a lag event is selected.
 
 Rendered as a single rich-text view to keep report switching lightweight.
 """
+import re
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QTextBrowser
 
@@ -34,11 +36,14 @@ CAUSE_ICONS = {
     "DISK_IO": "💿",
     "IO_STALL": "💿",
     "SCHEDULER_CONTENTION": "⚙️",
+    "DISPLAY_PIPELINE": "🖥️",
     "LOCAL_STUTTER": "📉",
     "UNDETERMINED": "❓",
     "FRAME_SPIKE": "📉",
     "FRAME_STUTTER": "🎞️",
     "FRAME_FREEZE": "🧊",
+    "FRAME_DROP": "🕳️",
+    "DISPLAY_STALL": "🖥️",
     "Window Not Responding": "🧊",
     "Visual Freeze": "🖼️",
     "Responsiveness Stall": "⏱️",
@@ -63,11 +68,14 @@ CAUSE_COLOURS = {
     "DISK_IO": "#1abc9c",
     "IO_STALL": "#1abc9c",
     "SCHEDULER_CONTENTION": MUTED,
+    "DISPLAY_PIPELINE": PURPLE,
     "LOCAL_STUTTER": AMBER,
     "UNDETERMINED": MUTED,
     "FRAME_SPIKE": ACCENT,
     "FRAME_STUTTER": "#e67e22",
     "FRAME_FREEZE": RED,
+    "FRAME_DROP": PURPLE,
+    "DISPLAY_STALL": PURPLE,
     "Window Not Responding": RED,
     "Visual Freeze": ACCENT,
     "Responsiveness Stall": AMBER,
@@ -92,11 +100,14 @@ CAUSE_LABELS_ZH = {
     "DISK_IO": "磁盘 / IO 瓶颈",
     "IO_STALL": "IO 阻塞",
     "SCHEDULER_CONTENTION": "调度竞争",
+    "DISPLAY_PIPELINE": "画面上屏异常",
     "LOCAL_STUTTER": "本地卡顿",
     "UNDETERMINED": "未确定类型",
     "FRAME_SPIKE": "帧时间尖峰",
     "FRAME_STUTTER": "帧时间卡顿",
     "FRAME_FREEZE": "画面冻结",
+    "FRAME_DROP": "帧未上屏",
+    "DISPLAY_STALL": "上屏间隔过长",
     "Window Not Responding": "窗口未响应",
     "Visual Freeze": "画面冻结",
     "Responsiveness Stall": "响应延迟卡顿",
@@ -191,7 +202,10 @@ class DetailPanelWidget(QWidget):
             "</div>",
         ]
 
-        if snapshot is not None:
+        # A snapshot with no samples is the recorder's zero-filled placeholder, so
+        # showing "Peak Metrics" for it would present 0% CPU / 0 ms response as
+        # measured readings for an event that clearly had a problem.
+        if snapshot is not None and self._has_system_context(snapshot):
             html.append(self._section_html("Peak Metrics" if self._report_language == "en" else "峰值指标"))
             html.append(self._metrics_html(event, snapshot))
             raw_metrics = self._raw_metrics_html(snapshot)
@@ -320,15 +334,103 @@ class DetailPanelWidget(QWidget):
         return CAUSE_LABELS_ZH.get(normalized, normalized)
 
     def _explanation_text(self, event: LagEvent, snapshot: LagSnapshot | None) -> str:
+        """
+        Cause text for the report header.
+
+        The Chinese branch rewrites the cause per category rather than using
+        event.cause verbatim, so the frame timings have to be re-attached
+        explicitly — otherwise routing frame events through the cause analyzer
+        would trade away the "what the player saw" half of the report.
+        """
         if self._report_language == "en":
             if event.is_pending:
                 return "This stutter is still in progress. The final report will be filled in after the game recovers."
-            return event.cause or "No explanation available."
+            cause = event.cause or "No explanation available."
+            summary = (event.frame_summary or "").strip()
+            # The analyzer already folds the summary into `cause` when the system
+            # rules won, so append only when it is genuinely missing instead of
+            # printing the same timings twice.
+            if summary and summary not in cause:
+                return f"{cause}\n\n{summary}"
+            return cause
         code = event.category or event.cause_code or "UNKNOWN"
         if event.is_pending:
             return "这次卡顿仍在进行中。为了避免正在生成报告本身拖慢界面，当前先显示轻量占位，等恢复后再补全完整结论。"
-        if snapshot is None:
-            return event.cause or "暂无详细说明。"
+        if snapshot is None or not self._has_system_context(snapshot):
+            # Without real samples the per-category text below would quote the
+            # recorder's zero-filled placeholder as if it had been measured
+            # ("峰值 CPU 0%"). Say what is actually known instead.
+            return self._with_frame_summary(
+                event, "本次卡顿没有采集到配套的系统快照，因此只能给出玩家侧的表现，暂时无法定位系统层根因。"
+            )
+        return self._with_frame_summary(event, self._cause_text_zh(event, snapshot, code))
+
+    @staticmethod
+    def _has_system_context(snapshot: LagSnapshot) -> bool:
+        """
+        True when the snapshot holds real measurements.
+
+        A frame event can end before the sampler ever produced a sample, and both
+        the recorder and the storage reader synthesise a zero-filled SystemSample
+        in that case. Rendering it would invent numbers, so callers gate on this.
+        """
+        return bool(snapshot.pre_lag_samples or snapshot.top_processes)
+
+    def _with_frame_summary(self, event: LagEvent, text: str) -> str:
+        summary = self._frame_summary_zh(event)
+        if not summary:
+            return text
+        return f"{text}\n\n{summary}"
+
+    @staticmethod
+    def _frame_summary_zh(event: LagEvent) -> str:
+        """
+        Translate the analyzer's frame summary into Chinese.
+
+        The analyzer emits it in English so it can be stored and reused
+        language-neutrally; parsing it back would be fragile, so the numbers are
+        re-extracted by regex and only the recognised shape is rendered.
+        """
+        raw = (event.frame_summary or "").strip()
+        if not raw:
+            return ""
+        is_compat = raw.startswith("Peak response delay")
+        label = "峰值响应延迟" if is_compat else "峰值帧时间"
+        # Matched by label, not by position. The previous version collected every
+        # "N ms" in the string and indexed into the list, so adding one sentence
+        # to the summary silently relabelled the numbers after it — the session
+        # baseline would have been printed as "peak CPU wait".
+        head = re.search(
+            r"reached ([\d.]+) ms \(avg ([\d.]+) ms, P95 ([\d.]+) ms\)", raw
+        )
+        if not head:
+            return ""
+        parts = [
+            f"玩家侧表现：{label} {head.group(1)} ms"
+            f"（平均 {head.group(2)} ms，P95 {head.group(3)} ms）。"
+        ]
+        baseline = re.search(r"Normal for this session was ([\d.]+) ms", raw)
+        if baseline:
+            parts.append(f"该会话正常帧时间约 {baseline.group(1)} ms。")
+        freeze = re.search(r"(\d+) freeze-level samples", raw)
+        slow = re.search(r"(\d+) slow samples", raw)
+        if freeze:
+            parts.append(f"其中 {freeze.group(1)} 个采样达到冻结级别。")
+        elif slow:
+            parts.append(f"其中 {slow.group(1)} 个采样偏慢。")
+        dropped = re.search(r"(\d+) frames never reached the screen", raw)
+        if dropped:
+            parts.append(f"另有 {dropped.group(1)} 帧没有出现在屏幕上。")
+        stages = re.search(
+            r"Peak CPU wait ([\d.]+) ms, peak GPU busy ([\d.]+) ms", raw
+        )
+        if stages:
+            parts.append(
+                f"峰值 CPU 等待 {stages.group(1)} ms，峰值 GPU 忙 {stages.group(2)} ms。"
+            )
+        return " ".join(parts)
+
+    def _cause_text_zh(self, event: LagEvent, snapshot: LagSnapshot, code: str) -> str:
         top_proc = snapshot.top_processes[0] if snapshot.top_processes else None
         if code in {"CPU_SPIKE", "CPU_BOUND"} and top_proc is not None:
             return f"检测到进程 {top_proc.name} (PID {top_proc.pid}) 的 CPU 占用达到 {top_proc.cpu_percent:.1f}%，很可能它是导致本次卡顿的主要原因。"
@@ -345,13 +447,18 @@ class DetailPanelWidget(QWidget):
             return "系统总内存并没有吃满，但目标游戏进程像是被限制在较窄的内存使用上限内。"
         if code in {"BACKGROUND_CLUSTER", "BACKGROUND_INTERFERENCE"}:
             return "检测到多个后台进程同时占用资源，没有单一元凶，但它们叠加后很可能挤占了游戏的 CPU 时间片。"
+        if code == "DISPLAY_PIPELINE":
+            return (
+                "游戏把帧提交出去了，但这些帧没有按时出现在屏幕上。这类卡顿在帧时间上看不出来，"
+                "常见于垂直同步/帧生成设置、桌面合成、覆盖层，或显示器刷新链路上的问题。"
+            )
         if code in {"DISK_IO", "IO_STALL"}:
             return f"本次卡顿更像是磁盘或 IO 瓶颈。峰值系统响应延迟达到 {snapshot.peak_responsiveness_ms:.1f} ms，而这类问题常见于加载、解压、杀毒扫描或分页。"
         if code == "DRIVER_RENDER_PATH":
             return "本次卡顿更像驱动、桌面合成、覆盖层或渲染链路异常，而不是典型的 CPU、内存或磁盘瓶颈。这个结论会保持保守，因为当前没有直接读取驱动内部状态。"
         if code in {"SCHEDULER_CONTENTION", "LOCAL_STUTTER"}:
             return f"系统处于综合性压力状态。峰值 CPU {snapshot.peak_cpu:.0f}%，响应延迟 {snapshot.peak_responsiveness_ms:.1f} ms，暂未识别出唯一的根因。"
-        if code in {"FRAME_SPIKE", "FRAME_STUTTER", "FRAME_FREEZE"}:
+        if code in {"FRAME_SPIKE", "FRAME_STUTTER", "FRAME_FREEZE", "FRAME_DROP", "DISPLAY_STALL"}:
             return f"这是一次以帧时间异常为主的卡顿事件，持续约 {event.duration_seconds:.1f} 秒。当前报告更偏向玩家看到的结果，而不是完整硬件根因。"
         if code == "Window Not Responding":
             return "游戏窗口在这段时间内出现了未响应现象，通常意味着主线程被阻塞，或游戏没有及时处理窗口消息。"

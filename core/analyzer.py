@@ -12,7 +12,10 @@ Each rule returns a (cause_code, explanation) tuple.
 Adding new rules is easy — just add a method prefixed with _rule_ and
 register it in RULE_PRIORITY.  The engine tries them in order.
 """
-from core.models import SystemSample, ProcessSample
+from dataclasses import dataclass
+
+from core.collectors import is_idle_pseudo_process
+from core.models import FrameStutterEpisode, SystemSample, ProcessSample
 
 CATEGORY_CPU_BOUND = "CPU_BOUND"
 CATEGORY_GPU_BOUND = "GPU_BOUND"
@@ -22,6 +25,10 @@ CATEGORY_GAME_MEMORY_LIMIT = "GAME_MEMORY_LIMIT"
 CATEGORY_VRAM_PRESSURE = "VRAM_PRESSURE"
 CATEGORY_DRIVER_RENDER_PATH = "DRIVER_RENDER_PATH"
 CATEGORY_IO_STALL = "IO_STALL"
+# Frames were produced on time but did not reach the screen on time. Comes from
+# the frame attribution rather than any system rule — no system counter can see
+# this, which is why the class used to be missed entirely.
+CATEGORY_DISPLAY_PIPELINE = "DISPLAY_PIPELINE"
 CATEGORY_BACKGROUND_INTERFERENCE = "BACKGROUND_INTERFERENCE"
 CATEGORY_LOCAL_STUTTER = "LOCAL_STUTTER"
 CATEGORY_UNDETERMINED = "UNDETERMINED"
@@ -40,12 +47,37 @@ RESP_HIGH_THRESHOLD_MS = 40.0       # ms — above this is "high responsiveness 
 VRAM_PRESSURE_RATIO = 0.92
 TARGET_MEMORY_LIMIT_MIN_MB = 1024.0
 
+# Verdicts that carry no actionable root cause. When the system rules land here
+# but the frame detector reached something specific (e.g. GPU_BOUND from frame
+# telemetry), the frame-side answer is the better one to show.
+WEAK_CATEGORIES = frozenset({CATEGORY_UNDETERMINED, CATEGORY_LOCAL_STUTTER})
+
+
+@dataclass
+class FrameCauseResult:
+    """
+    Cause verdict for a frame/response stutter episode.
+
+    Separate from the plain 3-tuple because a frame event carries both halves of
+    the story: what the player saw (frame timings) and why it happened (system
+    rules). Collapsing them into one string loses the ability to render or store
+    them independently.
+    """
+    category: str
+    explanation: str
+    scope: str
+    frame_summary: str = ""
+    system_cause: str = ""
+    # True when the system rules supplied the category, False when the frame
+    # detector's own classification was kept.
+    used_system_cause: bool = False
+
 
 class CauseAnalyzer:
 
     def analyze(self, peak_sample: SystemSample, pre_lag_samples: list[SystemSample]) -> tuple[str, str, str]:
         """
-        Returns (cause_code, human_readable_explanation).
+        Returns (category, human_readable_explanation, scope).
 
         peak_sample     — the SystemSample at peak lag
         pre_lag_samples — the 5 samples leading up to the lag event
@@ -59,9 +91,119 @@ class CauseAnalyzer:
             "to confidently separate CPU, RAM, disk, background load, or a possible network-side issue."
         ), SCOPE_UNDETERMINED
 
+    def analyze_frame_episode(
+        self,
+        episode: FrameStutterEpisode,
+        peak_sample: SystemSample | None,
+        pre_lag_samples: list[SystemSample],
+    ) -> FrameCauseResult:
+        """
+        Explain a frame/response stutter using the surrounding system snapshot.
+
+        Frame events used to bypass this class entirely: the report said "peak
+        frame time 180 ms" and stopped, even though the recorder had already
+        captured which process was eating the CPU at that moment. This runs the
+        same rules the system path uses, then keeps the frame timings alongside
+        the cause so the report can state both what the player saw and why.
+
+        The detector's own category is kept as a fallback, and deliberately wins
+        over a weak system verdict — GPU_BOUND inferred from frame telemetry is
+        better evidence than the analyzer's catch-all.
+        """
+        detector_category = (episode.category or "").strip()
+        detector_scope = (episode.scope or "").strip()
+
+        if peak_sample is None:
+            # No system context at all: the detector's own reading is all there is.
+            return FrameCauseResult(
+                category=detector_category or CATEGORY_LOCAL_STUTTER,
+                explanation=episode.explanation,
+                scope=detector_scope or SCOPE_LOCAL,
+                frame_summary=self.summarize_frame_episode(episode),
+                system_cause="",
+                used_system_cause=False,
+            )
+
+        system_category, system_cause, system_scope = self.analyze(peak_sample, pre_lag_samples)
+        frame_summary = self.summarize_frame_episode(episode)
+
+        # A concrete system finding (a named process, RAM exhaustion, VRAM
+        # pressure) explains the stutter better than the frame timings alone.
+        # The weak verdicts below are exactly the cases where the frame-side
+        # classification carries more information than the system rules.
+        system_is_weak = system_category in WEAK_CATEGORIES
+        detector_is_specific = bool(detector_category) and detector_category not in WEAK_CATEGORIES
+
+        if system_is_weak and detector_is_specific:
+            return FrameCauseResult(
+                category=detector_category,
+                explanation=f"{episode.explanation} {system_cause}".strip(),
+                scope=detector_scope or system_scope,
+                frame_summary=frame_summary,
+                system_cause=system_cause,
+                used_system_cause=False,
+            )
+
+        return FrameCauseResult(
+            category=system_category,
+            explanation=f"{system_cause} {frame_summary}".strip(),
+            scope=system_scope if not detector_scope or system_scope != SCOPE_UNDETERMINED else detector_scope,
+            frame_summary=frame_summary,
+            system_cause=system_cause,
+            used_system_cause=True,
+        )
+
+    @staticmethod
+    def summarize_frame_episode(episode: FrameStutterEpisode) -> str:
+        """
+        One-line "what the player saw" summary.
+
+        Compatibility mode measures window response delay rather than frame time,
+        so the wording follows the source instead of calling both "frame time".
+        """
+        is_compat = episode.present_mode == "compatibility"
+        label = "Peak response delay" if is_compat else "Peak frame time"
+        parts = [
+            f"{label} reached {episode.peak_frame_time_ms:.1f} ms "
+            f"(avg {episode.avg_frame_time_ms:.1f} ms, P95 {episode.p95_frame_time_ms:.1f} ms)."
+        ]
+        # The learned norm is what makes the peak mean anything: 30 ms is a
+        # non-event at 30 fps and a five-fold hitch at 240 Hz.
+        if not is_compat and episode.baseline_frame_time_ms > 0.0:
+            parts.append(
+                f"Normal for this session was {episode.baseline_frame_time_ms:.1f} ms."
+            )
+        if episode.freeze_frame_count:
+            parts.append(f"{episode.freeze_frame_count} freeze-level samples.")
+        elif episode.slow_frame_count:
+            parts.append(f"{episode.slow_frame_count} slow samples.")
+        if not is_compat and episode.dropped_frame_count:
+            parts.append(
+                f"{episode.dropped_frame_count} frames never reached the screen."
+            )
+        if not is_compat and (episode.peak_cpu_wait_ms or episode.peak_gpu_busy_ms):
+            parts.append(
+                f"Peak CPU wait {episode.peak_cpu_wait_ms:.1f} ms, "
+                f"peak GPU busy {episode.peak_gpu_busy_ms:.1f} ms."
+            )
+        return " ".join(parts)
+
     # ------------------------------------------------------------------
     # Rules (tried in order — first match wins)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _real_processes(processes: list[ProcessSample]) -> list[ProcessSample]:
+        """
+        Drop the kernel's idle bookkeeping entries before blaming anyone.
+
+        "System Idle Process" (PID 0) measures the time the CPU spent doing
+        nothing, so on a quiet machine it reports ~100% and used to be named as
+        the process that "was consuming 95% CPU". The collector already filters
+        it, but old snapshots read back from SQLite still contain it, so the rule
+        filters again rather than trusting the stored data.
+        """
+        return [p for p in processes if not is_idle_pseudo_process(p.pid, p.name)]
 
     def _rules(self):
         return [
@@ -129,9 +271,10 @@ class CauseAnalyzer:
         self, sample: SystemSample, _pre: list[SystemSample]
     ) -> tuple[str, str, str] | None:
         """One process is hogging the CPU."""
-        if not sample.top_processes:
+        candidates = self._real_processes(sample.top_processes)
+        if not candidates:
             return None
-        top = sample.top_processes[0]
+        top = candidates[0]
         if top.cpu_percent >= SINGLE_PROC_CPU_THRESHOLD:
             pct = round(top.cpu_percent, 1)
             return (
@@ -197,7 +340,9 @@ class CauseAnalyzer:
         self, sample: SystemSample, _pre: list[SystemSample]
     ) -> tuple[str, str, str] | None:
         """Many small background processes adding up to a lot of CPU."""
-        contributors = [p for p in sample.top_processes if p.cpu_percent >= 5.0]
+        contributors = [
+            p for p in self._real_processes(sample.top_processes) if p.cpu_percent >= 5.0
+        ]
         if len(contributors) >= BACKGROUND_CLUSTER_COUNT:
             names = ", ".join(f'"{p.name}"' for p in contributors[:5])
             total = round(sum(p.cpu_percent for p in contributors), 1)

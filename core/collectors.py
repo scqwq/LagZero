@@ -18,10 +18,34 @@ from core.models import SystemSample, ProcessSample, TargetProcessMetrics
 PROCESS_REFRESH_INTERVAL = 3
 GPU_REFRESH_INTERVAL = 2
 
+# "System Idle Process" (PID 0) accounts for the time the CPU spent doing
+# NOTHING. On an idle machine psutil reports it near 100%, and because the top
+# list is sorted by CPU it landed first, so the cause analyzer's "one process is
+# hogging the CPU" rule blamed the idle counter for the stutter. Its sibling
+# pseudo-processes carry kernel/interrupt time that no user can act on either, so
+# they are excluded from the "who is eating the CPU" ranking as well.
+IDLE_PSEUDO_PIDS = frozenset({0})
+IDLE_PSEUDO_NAMES = frozenset({
+    "system idle process",
+    "idle",
+})
+
 
 # ---------------------------------------------------------------------------
 # Responsiveness probe
 # ---------------------------------------------------------------------------
+
+def is_idle_pseudo_process(pid: int | None, name: str | None) -> bool:
+    """
+    True for the kernel's idle bookkeeping entries.
+
+    Matched on both PID and name because the PID is stable but the name is
+    localised on non-English Windows, and a name-only check would miss it.
+    """
+    if pid in IDLE_PSEUDO_PIDS:
+        return True
+    return (name or "").strip().lower() in IDLE_PSEUDO_NAMES
+
 
 def measure_responsiveness_ms() -> float:
     """
@@ -156,6 +180,8 @@ class SystemCollector(QThread):
         ):
             try:
                 info = proc.info
+                if is_idle_pseudo_process(info["pid"], info["name"]):
+                    continue
                 mem_mb = (info["memory_info"].rss / (1024 ** 2)) if info["memory_info"] else 0.0
                 procs.append(ProcessSample(
                     pid=info["pid"],

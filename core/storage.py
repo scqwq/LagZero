@@ -52,6 +52,10 @@ class LagEventRow(Base):
     category = Column(String(64), default="")
     scope = Column(String(64), default="")
     duration_seconds = Column(Float, default=0.0)
+    # Frame/response timings for detector-sourced events. Stored separately from
+    # `cause` so a reloaded report can still show what the player saw, not just
+    # the system-side root cause.
+    frame_summary = Column(Text, default="")
 
     snapshots = relationship("LagSnapshotRow", back_populates="event", cascade="all, delete-orphan")
 
@@ -95,6 +99,8 @@ class Storage:
                 conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN category VARCHAR(64) DEFAULT ''")
             if "scope" not in existing:
                 conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN scope VARCHAR(64) DEFAULT ''")
+            if "frame_summary" not in existing:
+                conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN frame_summary TEXT DEFAULT ''")
             snapshot_existing = {
                 row[1]
                 for row in conn.exec_driver_sql("PRAGMA table_info(lag_snapshots)").fetchall()
@@ -128,6 +134,7 @@ class Storage:
             row.category = event.category
             row.scope = event.scope
             row.duration_seconds = event.duration_seconds
+            row.frame_summary = event.frame_summary
 
             session.commit()
             session.refresh(row)
@@ -279,6 +286,7 @@ class Storage:
             category=row.category or "",
             scope=row.scope or "",
             duration_seconds=row.duration_seconds,
+            frame_summary=row.frame_summary or "",
         )
 
     @staticmethod

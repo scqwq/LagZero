@@ -150,7 +150,9 @@ class StatusDot(QLabel):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    cleanup_completed = Signal(int)
+    # Carries a CleanupReport, not a bare count: "0 cleaned" needs to read very
+    # differently depending on whether nothing was found or nothing was allowed.
+    cleanup_completed = Signal(object)
     probe_completed = Signal(str)
     recovery_completed = Signal(object)
     frame_detector_reset_requested = Signal()
@@ -650,17 +652,43 @@ class MainWindow(QMainWindow):
         self._flash_button(self._clean_sessions_btn, "正在清理残留 trace 会话…")
 
         def _worker():
-            count = self._presentmon.cleanup_stale_sessions()
-            self.cleanup_completed.emit(count)
+            self._presentmon.cleanup_stale_sessions()
+            self.cleanup_completed.emit(self._presentmon.last_cleanup_report())
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    @Slot(int)
-    def _on_cleanup_completed(self, count: int):
+    @Slot(object)
+    def _on_cleanup_completed(self, report):
         self._cleanup_in_progress = False
         self._clean_sessions_btn.setEnabled(True)
-        self._set_status_message(f"已清理 {count} 个残留 trace 会话", force=True)
-        self._flash_button(self._clean_sessions_btn, f"已清理 {count} 个残留 trace 会话")
+        message = self._describe_cleanup(report)
+        self._set_status_message(message, force=True)
+        self._flash_button(self._clean_sessions_btn, message)
+
+    @staticmethod
+    def _describe_cleanup(report) -> str:
+        """
+        Turn a CleanupReport into text that distinguishes the three outcomes.
+
+        Previously every result rendered as "已清理 N 个残留会话" using the count
+        of sessions *found*, so a denied cleanup looked like a successful one and
+        the user had no way to learn that elevation was the missing piece.
+        """
+        if report is None:
+            return "清理残留会话：无结果"
+        if report.found == 0:
+            return "没有发现残留 trace 会话"
+        if report.stopped == report.found:
+            return f"已清理 {report.stopped} 个残留 trace 会话"
+        if report.needs_elevation:
+            return (
+                f"发现 {report.found} 个残留会话，但停止被拒绝（需要管理员权限）。"
+                "请以管理员身份重启 LagLense 后再试。"
+            )
+        return (
+            f"已清理 {report.stopped}/{report.found} 个残留会话，"
+            f"{report.failed} 个失败：{report.detail or '原因未知'}"
+        )
 
     @Slot()
     def _probe_active_presents(self):
@@ -976,15 +1004,33 @@ class MainWindow(QMainWindow):
         event.ended_at = episode.ended_at
         event.peak_composite_score = episode.severity
         event.duration_seconds = (episode.ended_at - episode.started_at).total_seconds()
-        event.cause = episode.explanation
-        event.category = episode.category or self._classify_frame_category(episode)
-        event.cause_code = event.category
-        event.scope = episode.scope or "LOCAL"
         event.is_pending = False
+
+        # Capture first, then analyse: the snapshot is what gives the analyzer the
+        # process/RAM/VRAM context. Frame events used to skip the analyzer entirely
+        # and report only frame timings, even though this snapshot was already
+        # being recorded and persisted.
+        snapshot = self._recorder.capture(event)
+        # An empty pre-lag buffer means the recorder never saw a real sample, so
+        # snapshot.peak_sample is its zero-filled placeholder. Feeding that to the
+        # rules would manufacture a verdict out of nothing.
+        peak_sample = snapshot.peak_sample if snapshot.pre_lag_samples else None
+        if not episode.category:
+            episode.category = self._classify_frame_category(episode)
+        verdict = self._analyzer.analyze_frame_episode(
+            episode, peak_sample, snapshot.pre_lag_samples
+        )
+        event.cause = verdict.explanation
+        event.category = verdict.category
+        event.cause_code = verdict.category
+        event.scope = verdict.scope
+        event.frame_summary = verdict.frame_summary
 
         event_id = self._storage.save_event(event)
         event.id = event_id
-        snapshot = self._recorder.capture(event)
+        # Reuse the snapshot captured above rather than calling capture() again:
+        # the first call reset the peak tracker, so a second call would return a
+        # different, emptier snapshot than the one the verdict was derived from.
         snapshot.event_id = event_id
         self._storage.save_snapshot(snapshot)
         self._snapshot_cache[event_id] = snapshot
@@ -1250,12 +1296,30 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _classify_frame_category(episode: FrameStutterEpisode) -> str:
-        if episode.peak_gpu_busy_ms >= max(12.0, episode.peak_cpu_wait_ms + 2.0):
-            return "GPU_BOUND"
-        if episode.peak_cpu_wait_ms >= max(18.0, episode.peak_gpu_busy_ms):
-            return "CPU_BOUND"
-        if episode.event_type == "FRAME_FREEZE":
-            return "LOCAL_STUTTER"
+        """
+        Frame-side guess at the bottleneck, used only as a fallback.
+
+        This is deliberately the weaker input: CauseAnalyzer prefers a concrete
+        system verdict and only falls back to this when the system rules land on
+        UNDETERMINED / LOCAL_STUTTER. Compatibility mode reports no CPU wait or
+        GPU busy at all, so it never reaches here with useful numbers — the
+        compat detector sets its own category instead.
+
+        The real work now happens in core.frame_attribution, which splits the
+        worst frame's excess time across CPU / GPU / present-path / display using
+        each stage's own learned baseline. This method used to re-derive a verdict
+        from two fixed thresholds over peak_gpu_busy and peak_cpu_wait — numbers
+        the old v1 mapping had transposed, and that meant nothing without knowing
+        what the game normally runs at.
+        """
+        attribution = episode.attribution
+        # A low-confidence verdict deliberately does NOT win here: it has to stay
+        # weak so CauseAnalyzer's system rules can outrank it, instead of a
+        # 0.3-confidence guess being printed as the cause.
+        if attribution is not None and attribution.category and attribution.is_confident:
+            return attribution.category
+        if episode.dropped_frame_count:
+            return "DISPLAY_PIPELINE"
         return "LOCAL_STUTTER"
 
     def _flash_button(self, button: QPushButton, status_text: str):
