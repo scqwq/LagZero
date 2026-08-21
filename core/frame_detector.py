@@ -35,7 +35,14 @@ from core.models import FrameSample, FrameStutterEpisode
 SPIKE_FLOOR_MS = 20.0
 STUTTER_FLOOR_MS = 33.0
 FREEZE_FLOOR_MS = 150.0
-DISPLAY_FLOOR_MS = 22.0
+# Warmup thresholds: absolute values used until the baseline has enough samples
+# to know this game's rhythm. A 30 fps game's normal 33.3 ms frame sits exactly
+# on STUTTER_FLOOR_MS, so using the floors during warmup flagged every single
+# frame of a slow game AND kept them out of the baseline (stutter frames are not
+# learned), which meant the baseline never became ready. These mirror the old
+# fixed detector: conservative, wrong for nobody who wasn't already covered.
+WARMUP_SPIKE_MS = 50.0
+WARMUP_STUTTER_MS = 66.0
 
 # Additive margins are what make the thresholds work at both ends of the refresh
 # range: 4 ms + 14 ms flags a 5x hitch at 240 Hz, 33 ms + 14 ms does not flag
@@ -43,11 +50,25 @@ DISPLAY_FLOOR_MS = 22.0
 SPIKE_MARGIN_MS = 14.0
 STUTTER_MARGIN_MS = 28.0
 FREEZE_MARGIN_MS = 120.0
-DISPLAY_MARGIN_MS = 14.0
+# Ratio lines, same idea as the margins but multiplicative: a frame costing
+# several times its own norm is a hitch at ANY refresh rate.
+SPIKE_RATIO = 2.0
+STUTTER_RATIO = 3.5
+DISPLAY_MARGIN_MS = 6.0
+# Display floors are a RATIO, not milliseconds: a fixed 22 ms floor would flag
+# every frame of a 30 fps game (33 ms display intervals are normal there). What
+# is perceptible is the screen going quiet for much longer than its own rhythm.
+DISPLAY_FLOOR_RATIO = 2.0
 
 SPIKE_SIGMAS = 3.0
 STUTTER_SIGMAS = 5.0
 DISPLAY_SIGMAS = 4.0
+# A frame submitted quickly but shown much later than it was submitted. The
+# display gap only means something independent when it exceeds the frame's own
+# cost — otherwise it is just the frame being slow, which the frame thresholds
+# already catch, and the two detectors would fire together on one event.
+DISPLAY_LAG_RATIO = 1.5
+DISPLAY_LAG_FLOOR_MS = 8.0
 
 BASELINE_MIN_FRAMES = 120
 MIN_WINDOW_SAMPLES = 12
@@ -165,10 +186,18 @@ class FrameStutterDetector(QObject):
     # ------------------------------------------------------------------
 
     def _spike_threshold(self) -> float:
-        return self._threshold(self._frame_base, SPIKE_SIGMAS, SPIKE_MARGIN_MS, SPIKE_FLOOR_MS)
+        if not self._frame_base.is_ready:
+            return WARMUP_SPIKE_MS
+        return self._threshold(
+            self._frame_base, SPIKE_SIGMAS, SPIKE_MARGIN_MS, SPIKE_RATIO, SPIKE_FLOOR_MS
+        )
 
     def _stutter_threshold(self) -> float:
-        return self._threshold(self._frame_base, STUTTER_SIGMAS, STUTTER_MARGIN_MS, STUTTER_FLOOR_MS)
+        if not self._frame_base.is_ready:
+            return WARMUP_STUTTER_MS
+        return self._threshold(
+            self._frame_base, STUTTER_SIGMAS, STUTTER_MARGIN_MS, STUTTER_RATIO, STUTTER_FLOOR_MS
+        )
 
     def _freeze_threshold(self) -> float:
         # A freeze is absolute: 150 ms of nothing is a freeze in any game. The
@@ -178,23 +207,47 @@ class FrameStutterDetector(QObject):
         return max(FREEZE_FLOOR_MS, self._frame_base.mean + FREEZE_MARGIN_MS)
 
     def _display_threshold(self) -> float:
-        return self._threshold(
-            self._display_base, DISPLAY_SIGMAS, DISPLAY_MARGIN_MS, DISPLAY_FLOOR_MS
+        """
+        Display-gap line, in the same units as the frame-time line.
+
+        Scaled by the learned display norm instead of a fixed millisecond floor:
+        33 ms gaps are a 30 fps game's healthy rhythm and must not raise the
+        flag, while the same 33 ms at 240 Hz is the screen going quiet for eight
+        frames. The fixed addend covers a steady capture where std≈0.
+        """
+        base = self._display_base
+        if not base.is_ready or base.mean <= 0.0:
+            # No rhythm learned yet; a 2x multiple of nothing is nothing, so
+            # until ready only genuine dropped frames (was_displayed == False)
+            # count on the display side.
+            return float("inf")
+        return max(
+            base.mean * DISPLAY_FLOOR_RATIO,
+            base.mean + DISPLAY_MARGIN_MS,
+            base.mean + DISPLAY_SIGMAS * base.std,
         )
 
     @staticmethod
-    def _threshold(base: WelfordBaseline, sigmas: float, margin: float, floor: float) -> float:
+    def _threshold(
+        base: WelfordBaseline, sigmas: float, margin: float, ratio: float, floor: float
+    ) -> float:
         """
-        max(floor, mean + margin, mean + sigmas*std).
+        max(floor, mean*ratio, mean + margin, mean + sigmas*std).
 
-        The margin term is what covers a steady high-refresh capture, where std is
-        tiny and mean+Nσ would sit only fractions of a millisecond above normal.
-        The sigma term covers a naturally jittery game, where a fixed margin would
-        fire constantly.
+        The ratio term scales with the game's own rhythm (a 3.5x norm at 4 ms and
+        at 33 ms both mean "a visible hitch"). The margin term covers a steady
+        capture where std≈0 and 2x would flag sub-millisecond jitter. The sigma
+        term covers a naturally jittery game, where a fixed margin would fire
+        constantly. The floor is only a backstop, never the deciding term.
         """
         if not base.is_ready or base.mean <= 0.0:
             return floor
-        return max(floor, base.mean + margin, base.mean + sigmas * base.std)
+        return max(
+            floor,
+            base.mean * ratio,
+            base.mean + margin,
+            base.mean + sigmas * base.std,
+        )
 
     def _is_stutter(self, sample: FrameSample) -> tuple[bool, str]:
         frame_ms = sample.frame_time_ms
@@ -207,7 +260,15 @@ class FrameStutterDetector(QObject):
         # because frame_time_ms looks perfectly healthy on a dropped frame.
         if not sample.was_displayed:
             return True, "FRAME_DROP"
-        if sample.displayed_time_ms >= self._display_threshold():
+        # A long display gap that merely tracks a slow frame is not an
+        # independent finding — the frame thresholds above already reported it.
+        # The display side is only its own stutter class when the screen went
+        # quiet for longer than the frame itself cost (submitted on time, shown
+        # late) or beyond this game's learned display rhythm.
+        if sample.displayed_time_ms >= self._display_threshold() and (
+            sample.displayed_time_ms >= frame_ms * DISPLAY_LAG_RATIO
+            or sample.displayed_time_ms - frame_ms >= DISPLAY_LAG_FLOOR_MS
+        ):
             return True, "DISPLAY_STALL"
 
         spike_threshold = self._spike_threshold()
@@ -325,12 +386,23 @@ class FrameStutterDetector(QObject):
         has_breakdown = self._present_mode != "compatibility" and any(
             (self._peak_cpu_busy, self._peak_cpu_wait, self._peak_gpu_busy)
         )
+        # The display bucket must not double-bill a slow frame. A long render
+        # stretches the display gap by the same milliseconds, and counting that
+        # stretch as "display" too would split one GPU hitch into 50% GPU / 50%
+        # display. Only the part of the gap that outlasts the frame's own cost
+        # is an independent display-side finding.
+        display_excess_only = max(
+            0.0, self._peak_display_gap - self._peak_frame_time
+        )
         return attribute_stutter(
             frame=StageReading(self._peak_frame_time, self._frame_base.mean),
             cpu_busy=StageReading(self._peak_cpu_busy, self._cpu_busy_base.mean),
             cpu_wait=StageReading(self._peak_cpu_wait, self._cpu_wait_base.mean),
             gpu_busy=StageReading(self._peak_gpu_busy, self._gpu_busy_base.mean),
-            display=StageReading(self._peak_display_gap, self._display_base.mean),
+            display=StageReading(
+                self._display_base.mean + display_excess_only,
+                self._display_base.mean,
+            ),
             dropped_ratio=dropped_ratio,
             baseline_ready=self._frame_base.is_ready,
             has_frame_breakdown=has_breakdown,

@@ -117,7 +117,9 @@ def attribute_stutter(
     return FrameAttribution(
         category=category,
         confidence=confidence,
-        evidence=_evidence_lines(frame, buckets, total, dropped_ratio),
+        evidence=_evidence_lines(
+            frame, buckets, total, dropped_ratio, baseline_ready
+        ),
         cpu_share=round(cpu_bucket / total, 3),
         gpu_share=round(gpu_bucket / total, 3),
         display_share=round(display_bucket / total, 3),
@@ -139,10 +141,23 @@ def _evidence_lines(
     buckets: dict[str, float],
     total: float,
     dropped_ratio: float,
+    baseline_ready: bool = True,
 ) -> list[str]:
-    lines = [
-        f"Frame time peaked at {frame.peak:.1f} ms against a {frame.baseline:.1f} ms norm."
-    ]
+    lines: list[str] = []
+    # On a pure drop episode (healthy frame time, frames never shown) the
+    # frame-vs-norm comparison is meaningless — 4.1 ms against a 4.1 ms norm says
+    # nothing. Lead with what actually happened instead.
+    if frame.excess >= MIN_TOTAL_EXCESS_MS:
+        lines.append(
+            f"Frame time peaked at {frame.peak:.1f} ms against a {frame.baseline:.1f} ms norm."
+        )
+    elif dropped_ratio > 0.0:
+        lines.append(
+            f"Frame time stayed near its {frame.baseline:.1f} ms norm, "
+            f"but the screen did not show every frame."
+        )
+    else:
+        lines.append(_unexplained_line(frame))
     templates = {
         CATEGORY_CPU: "the game's own CPU work",
         CATEGORY_GPU: "GPU rendering (including the wait it forced on the CPU)",
@@ -158,4 +173,8 @@ def _evidence_lines(
         )
     if dropped_ratio > 0.0:
         lines.append(f"{dropped_ratio * 100:.0f}% of frames never reached the screen.")
+    if not baseline_ready:
+        lines.append(
+            "Confidence is limited: not enough calm frames were seen to learn this game's normal rhythm."
+        )
     return lines

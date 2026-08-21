@@ -186,6 +186,14 @@ class CauseAnalyzer:
                 f"Peak CPU wait {episode.peak_cpu_wait_ms:.1f} ms, "
                 f"peak GPU busy {episode.peak_gpu_busy_ms:.1f} ms."
             )
+        # End-to-end input latency is only reported when PresentMon actually
+        # correlated an input event with the frame — it is NA more often than not
+        # (measured NA in 1837/1837 desktop-composition rows), so a 0.0 here must
+        # never be printed as "zero latency".
+        if not is_compat and episode.peak_input_latency_ms > 0.0:
+            parts.append(
+                f"Peak end-to-end input latency {episode.peak_input_latency_ms:.1f} ms."
+            )
         return " ".join(parts)
 
     # ------------------------------------------------------------------

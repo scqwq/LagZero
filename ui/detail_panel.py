@@ -428,6 +428,9 @@ class DetailPanelWidget(QWidget):
             parts.append(
                 f"峰值 CPU 等待 {stages.group(1)} ms，峰值 GPU 忙 {stages.group(2)} ms。"
             )
+        latency = re.search(r"Peak end-to-end input latency ([\d.]+) ms", raw)
+        if latency:
+            parts.append(f"端到端输入延迟峰值 {latency.group(1)} ms。")
         return " ".join(parts)
 
     def _cause_text_zh(self, event: LagEvent, snapshot: LagSnapshot, code: str) -> str:
