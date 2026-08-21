@@ -48,6 +48,10 @@ TEXT  = "#e6edf3"
 MUTED = "#8b949e"
 ACCENT = "#58a6ff"
 COMPAT_RECOVERY_METRICS_REQUIRED = 6
+AUTO_HIGH_PRECISION_RECOVERY_INTERVAL_MS = 20000
+AUTO_HIGH_PRECISION_RECOVERY_COOLDOWN_S = 30.0
+MANUAL_HIGH_PRECISION_RECOVERY_DURATION_S = 0
+AUTO_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 
 EVENT_LABELS = {
     "COMPAT_WINDOW_HANG": "Window Not Responding",
@@ -148,6 +152,7 @@ class StatusDot(QLabel):
 class MainWindow(QMainWindow):
     cleanup_completed = Signal(int)
     probe_completed = Signal(str)
+    recovery_completed = Signal(object)
     frame_detector_reset_requested = Signal()
     snapshot_loaded = Signal(object, object)
 
@@ -188,6 +193,7 @@ class MainWindow(QMainWindow):
         self._button_feedback_timers: dict[QPushButton, QTimer] = {}
         self._cleanup_in_progress = False
         self._probe_in_progress = False
+        self._recovery_in_progress = False
         self._pending_frame_metrics: FrameMetricsSnapshot | None = None
         self._pending_compat_metrics: CompatibilityMetricsSnapshot | None = None
         self._snapshot_cache: dict[int, LagSnapshot | None] = {}
@@ -207,6 +213,7 @@ class MainWindow(QMainWindow):
         self._last_capture_diag_text = ""
         self._last_capture_diag_ts = 0.0
         self._manual_candidate_hold_until = 0.0
+        self._last_high_precision_recovery_ts = 0.0
 
         self.setWindowTitle("LagLense")
         self.resize(1100, 720)
@@ -222,6 +229,9 @@ class MainWindow(QMainWindow):
         self._candidate_debounce_timer = QTimer(self)
         self._candidate_debounce_timer.setSingleShot(True)
         self._candidate_debounce_timer.timeout.connect(self._apply_deferred_candidates)
+        self._auto_recover_timer = QTimer(self)
+        self._auto_recover_timer.timeout.connect(self._maybe_auto_recover_high_precision)
+        self._auto_recover_timer.start(AUTO_HIGH_PRECISION_RECOVERY_INTERVAL_MS)
 
     # ------------------------------------------------------------------
     # Build UI
@@ -299,12 +309,14 @@ class MainWindow(QMainWindow):
         self._apply_target_btn = QPushButton("应用目标")
         self._clean_sessions_btn = QPushButton("清理残留会话")
         self._probe_btn = QPushButton("探测 Present")
+        self._recover_btn = QPushButton("恢复高精度")
         control_row.addWidget(self._auto_checkbox)
         control_row.addWidget(self._candidate_combo, stretch=1)
         control_row.addWidget(self._target_input)
         control_row.addWidget(self._apply_target_btn)
         control_row.addWidget(self._clean_sessions_btn)
         control_row.addWidget(self._probe_btn)
+        control_row.addWidget(self._recover_btn)
         capture_layout.addLayout(control_row)
 
         telemetry_row = QHBoxLayout()
@@ -367,8 +379,10 @@ class MainWindow(QMainWindow):
         self._apply_target_btn.clicked.connect(self._apply_manual_target)
         self._clean_sessions_btn.clicked.connect(self._clean_stale_sessions)
         self._probe_btn.clicked.connect(self._probe_active_presents)
+        self._recover_btn.clicked.connect(self._recover_high_precision)
         self.cleanup_completed.connect(self._on_cleanup_completed)
         self.probe_completed.connect(self._on_probe_completed)
+        self.recovery_completed.connect(self._on_recovery_completed)
         self.snapshot_loaded.connect(self._on_snapshot_loaded)
         if self._session_detector is not None:
             self._session_detector.session_changed.connect(self._on_session_changed)
@@ -650,10 +664,10 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _probe_active_presents(self):
-        if self._presentmon is None or self._probe_in_progress:
+        if self._presentmon is None or self._probe_in_progress or self._recovery_in_progress:
             return
         self._probe_in_progress = True
-        self._probe_btn.setEnabled(False)
+        self._set_capture_action_buttons_enabled(False)
         self._probe_result_label.setText("探测：正在执行 3 秒无过滤 Present 扫描…")
         self._flash_button(self._probe_btn, "正在探测哪些进程真正产生 Present…")
 
@@ -666,10 +680,76 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_probe_completed(self, result: str):
         self._probe_in_progress = False
-        self._probe_btn.setEnabled(True)
+        self._set_capture_action_buttons_enabled(True)
         self._probe_result_label.setText(f"探测：{result}")
         self._set_status_message("Present 探测完成", force=True)
         self._flash_button(self._probe_btn, "Present 探测完成")
+
+    @Slot()
+    def _recover_high_precision(self):
+        self._start_high_precision_recovery(
+            duration_seconds=MANUAL_HIGH_PRECISION_RECOVERY_DURATION_S,
+            manual=True,
+        )
+
+    def _start_high_precision_recovery(self, *, duration_seconds: int, manual: bool):
+        if self._presentmon is None or self._probe_in_progress or self._recovery_in_progress:
+            return
+        target_name, target_pid = self._presentmon.requested_target()
+        if not target_name and not target_pid:
+            if manual:
+                self._set_status_message("请先应用一个采集目标，再尝试恢复高精度。", force=True)
+            return
+
+        self._recovery_in_progress = True
+        self._last_high_precision_recovery_ts = monotonic()
+        self._set_capture_action_buttons_enabled(False)
+        failure_reason = self._presentmon.last_failure_reason().lower()
+        if manual:
+            if "1450" in failure_reason:
+                self._probe_result_label.setText("恢复：检测到 ETW 会话受阻，正在清理残留并直接重启高精度捕获…")
+            else:
+                self._probe_result_label.setText("恢复：正在直接重启高精度捕获，避免额外 probe 会话…")
+            self._flash_button(self._recover_btn, "正在尝试恢复高精度采集…")
+        else:
+            self._set_capture_diag_text(
+                "诊断：兼容模式下正在低频直接重启高精度采集，避免额外 trace probe…",
+                min_interval=0.35,
+            )
+
+        def _worker():
+            result = self._presentmon.recover_high_precision_target(duration_seconds=duration_seconds)
+            self.recovery_completed.emit({"manual": manual, "result": result})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(object)
+    def _on_recovery_completed(self, payload: object):
+        info = payload if isinstance(payload, dict) else {"manual": True, "result": str(payload or "")}
+        manual = bool(info.get("manual"))
+        result = str(info.get("result") or "")
+        self._recovery_in_progress = False
+        self._set_capture_action_buttons_enabled(True)
+
+        prefix = "恢复" if manual else "自动恢复"
+        self._probe_result_label.setText(f"{prefix}：{result}")
+        lowered = result.lower()
+        success = "waiting for frame data" in lowered or "restarted high-precision capture" in lowered
+        if success:
+            self._set_status_message("高精度恢复流程已重启，正在等待新的帧数据", force=True)
+        elif "1450" in lowered:
+            self._set_status_message("高精度恢复受阻：ETW trace 会话仍然启动失败", force=True)
+        elif manual:
+            self._set_status_message("高精度恢复流程完成，但高精度采集仍未成功启动", force=True)
+
+        if manual:
+            button_text = "高精度恢复已重启" if success else "高精度恢复受阻，已保留兼容模式"
+            if "1450" in lowered:
+                button_text = "ETW 会话仍受阻，已保留兼容模式"
+            self._flash_button(
+                self._recover_btn,
+                button_text,
+            )
 
     @Slot(object)
     def _on_session_changed(self, session: GameSessionInfo):
@@ -775,6 +855,25 @@ class MainWindow(QMainWindow):
             self._activate_compatibility_mode(message)
         self._set_status_message(message)
 
+    @Slot()
+    def _maybe_auto_recover_high_precision(self):
+        if not self._compat_active or self._presentmon is None:
+            return
+        if self._probe_in_progress or self._recovery_in_progress:
+            return
+        failure_reason = self._presentmon.last_failure_reason().lower()
+        if "access denied" in failure_reason or "1450" in failure_reason:
+            return
+        target_name, target_pid = self._presentmon.requested_target()
+        if not target_name and not target_pid:
+            return
+        if (monotonic() - self._last_high_precision_recovery_ts) < AUTO_HIGH_PRECISION_RECOVERY_COOLDOWN_S:
+            return
+        self._start_high_precision_recovery(
+            duration_seconds=AUTO_HIGH_PRECISION_RECOVERY_DURATION_S,
+            manual=False,
+        )
+
     @Slot(object)
     def _on_frame_metrics(self, metrics: FrameMetricsSnapshot):
         if self._compat_active:
@@ -825,6 +924,17 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_requested_target_changed(self, description: str):
         self._capture_identity_label.setText(f"采集目标：{description}")
+        if self._presentmon is None:
+            return
+        target, pid = self._presentmon.requested_target()
+        if target:
+            self._target_input.setText(target)
+        if hasattr(self._collector, "set_tracked_process"):
+            self._collector.set_tracked_process(target, pid)
+        if self._compat_capture is not None:
+            self._compat_capture.set_target(target, pid=pid)
+        if self._frame_detector is not None:
+            self.frame_detector_reset_requested.emit()
 
     @Slot(str)
     def _on_capture_identity_changed(self, description: str):
@@ -1045,6 +1155,10 @@ class MainWindow(QMainWindow):
         self._ft_value.setText(text)
         self._p95_value.setText(text)
         self._wait_value.setText(text)
+
+    def _set_capture_action_buttons_enabled(self, enabled: bool):
+        self._probe_btn.setEnabled(enabled)
+        self._recover_btn.setEnabled(enabled)
 
     def _activate_compatibility_mode(self, reason: str):
         if self._compat_capture is None or self._compat_active:

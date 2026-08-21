@@ -162,6 +162,7 @@ class PresentMonBridge(QObject):
     _stdout_chunk_received = Signal(str)
     _probe_pause_requested = Signal(object)
     _probe_resume_requested = Signal(object)
+    _recovery_apply_requested = Signal(object)
 
     def __init__(self, executable: Path | None = None, parent=None):
         super().__init__(parent)
@@ -193,6 +194,7 @@ class PresentMonBridge(QObject):
         self._initial_cleanup_done = False
         self._last_stderr_line = ""
         self._last_stderr_emit_ts = 0.0
+        self._last_failure_reason = ""
         self._startup_timeout_notified = False
         self._startup_timer = QTimer(self)
         self._startup_timer.setSingleShot(True)
@@ -208,6 +210,7 @@ class PresentMonBridge(QObject):
         self._stdout_chunk_received.connect(self._parser.process_chunk)
         self._probe_pause_requested.connect(self._pause_capture_for_probe)
         self._probe_resume_requested.connect(self._resume_capture_after_probe)
+        self._recovery_apply_requested.connect(self._dispatch_recovery_action)
         self._parser_thread.start()
 
     @property
@@ -216,6 +219,12 @@ class PresentMonBridge(QObject):
 
     def is_available(self) -> bool:
         return self._resolve_executable().exists()
+
+    def requested_target(self) -> tuple[str, int | None]:
+        return self._target_process, self._target_pid
+
+    def last_failure_reason(self) -> str:
+        return self._last_failure_reason
 
     def set_target(self, process_name: str = "", pid: int | None = None) -> bool:
         target = (process_name or "").strip()
@@ -281,6 +290,7 @@ class PresentMonBridge(QObject):
         self._received_frame = False
         self._received_header = False
         self._last_error_text = ""
+        self._last_failure_reason = ""
         self._auto_retry_done = False
         self._pending_restart = False
         self._startup_timeout_notified = False
@@ -400,6 +410,44 @@ class PresentMonBridge(QObject):
                 self._probe_resume_requested.emit(resume_done)
                 resume_done.wait(3.0)
 
+    def recover_high_precision_target(self, duration_seconds: int = 3) -> str:
+        target_name = (self._target_process or "").strip()
+        if not target_name and not self._target_pid:
+            return "Manual recovery requires a target process first."
+        lowered_failure = (self._last_failure_reason or "").lower()
+        target_desc = self.target_description()
+        using_name_match = bool(self._target_process)
+        clean_count = 0
+
+        # When ETW session startup is already failing, avoid creating an extra
+        # probe session. Clean stale LagLense/PresentMon sessions and retry the
+        # main capture directly to keep session churn low.
+        if "1450" in lowered_failure:
+            clean_count = self.cleanup_stale_sessions(include_active=False)
+
+        apply_result = self._restart_capture_sync(prefer_process_name=using_name_match)
+        if not apply_result.get("applied"):
+            if "1450" in lowered_failure:
+                return (
+                    f"Recovery could not restart high-precision capture for {target_desc} after "
+                    f"cleaning {clean_count} stale session(s). PresentMon is still blocked by trace session error 1450."
+                )
+            return f"Recovery could not restart high-precision capture for {target_desc}."
+
+        if "1450" in lowered_failure:
+            mode_hint = "process-name match" if using_name_match else "current PID"
+            return (
+                f"Recovery cleaned {clean_count} stale session(s) and restarted high-precision capture "
+                f"for {target_desc} using {mode_hint}. Waiting for frame data."
+            )
+
+        if using_name_match and self._target_pid:
+            return (
+                f"Recovery restarted high-precision capture for {target_desc} using process-name match "
+                "to reduce PID churn. Waiting for frame data."
+            )
+        return f"Recovery restarted high-precision capture for {target_desc}. Waiting for frame data."
+
     def _read_stdout(self):
         chunk = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="ignore")
         if not chunk:
@@ -418,19 +466,23 @@ class PresentMonBridge(QObject):
             self._last_stderr_emit_ts = now
             self._last_error_text = line
             if "access denied" in lowered:
+                self._last_failure_reason = "access denied"
                 self.error_occurred.emit(
                     "PresentMon failed with ACCESS DENIED. Please restart LagLense as Administrator."
                 )
             if "1450" in lowered:
+                self._last_failure_reason = "trace session error 1450"
                 self.error_occurred.emit(
                     "PresentMon failed with trace session error 1450. Try 'Clean Stale Sessions' first; if it persists, reboot Windows."
                 )
                 self._set_status("PresentMon trace session error 1450. Waiting for manual cleanup.")
                 return
             if "events were lost" in lowered or "30034" in lowered or "18717" in lowered:
+                self._last_failure_reason = "events were lost"
                 self._set_status("PresentMon warning: ETW events were lost; capture may be incomplete.")
                 return
             if "session" in lowered and "different name" in lowered:
+                self._last_failure_reason = "session name conflict"
                 self.error_occurred.emit(
                     f"PresentMon session conflict on {self._session_name}. Will need a fresh restart."
                 )
@@ -440,12 +492,14 @@ class PresentMonBridge(QObject):
     def _on_header_seen(self):
         self._received_header = True
         self._startup_timeout_notified = False
+        self._last_failure_reason = ""
         self._startup_timer.stop()
         self._set_status(f"Capturing {self.target_description()}")
 
     @Slot(object)
     def _on_sample_parsed(self, sample: FrameSample):
         self._received_frame = True
+        self._last_failure_reason = ""
 
     @Slot(object)
     def _on_metrics_ready(self, metrics: FrameMetricsSnapshot):
@@ -459,6 +513,7 @@ class PresentMonBridge(QObject):
     def _on_process_error(self, error):
         self._startup_timer.stop()
         self._last_error_text = f"Process error: {error}"
+        self._last_failure_reason = f"process error: {error}"
         self._emit_diagnostics(force=True)
         self.error_occurred.emit(f"PresentMon process error: {error}")
 
@@ -512,6 +567,154 @@ class PresentMonBridge(QObject):
         )
         self.restart_capture()
         return True
+
+    @staticmethod
+    def _parse_probe_matches(result: str) -> list[tuple[str, int, int]]:
+        matches: list[tuple[str, int, int]] = []
+        for line in (result or "").splitlines():
+            match = re.search(r"^(?P<app>.+?) \(PID (?P<pid>\d+)\) -> (?P<count>\d+) samples$", line.strip())
+            if not match:
+                continue
+            matches.append(
+                (
+                    match.group("app").strip(),
+                    int(match.group("pid")),
+                    int(match.group("count")),
+                )
+            )
+        return matches
+
+    def find_recovery_candidate(
+        self,
+        result: str,
+        process_name: str | None = None,
+        pid: int | None = None,
+    ) -> tuple[str, int, int] | None:
+        matches = self._parse_probe_matches(result)
+        if not matches:
+            return None
+
+        target_name = (process_name if process_name is not None else self._target_process or "").strip()
+        target_pid = pid if pid and pid > 0 else self._target_pid
+        lowered = target_name.lower()
+        target_stem = lowered.removesuffix(".exe")
+
+        ranked: list[tuple[int, int, str, int]] = []
+        for app, match_pid, count in matches:
+            app_lower = app.lower()
+            app_stem = app_lower.removesuffix(".exe")
+            pid_match = bool(target_pid and match_pid == target_pid)
+            exact_match = bool(lowered and app_lower == lowered)
+            stem_match = bool(target_stem and app_stem == target_stem)
+            if not (pid_match or exact_match or stem_match):
+                continue
+            score = count
+            if stem_match:
+                score += 10_000
+            if exact_match:
+                score += 20_000
+            if pid_match:
+                score += 40_000
+            ranked.append((score, count, app, match_pid))
+
+        if not ranked:
+            return None
+
+        ranked.sort(reverse=True)
+        _, count, app, match_pid = ranked[0]
+        return app, match_pid, count
+
+    def _apply_recovery_target_sync(self, process_name: str, pid: int) -> dict[str, bool]:
+        payload = {
+            "process_name": process_name,
+            "pid": pid,
+            "applied": False,
+            "changed": False,
+            "started": False,
+        }
+        if QThread.currentThread() == self.thread():
+            self._apply_recovery_target(payload)
+            return payload
+        done_event = threading.Event()
+        payload["done_event"] = done_event
+        self._recovery_apply_requested.emit(payload)
+        done_event.wait(3.0)
+        return payload
+
+    @Slot(object)
+    def _dispatch_recovery_action(self, payload):
+        if "process_name" in payload or "pid" in payload:
+            self._apply_recovery_target(payload)
+            return
+        self._restart_capture_with_mode(payload)
+
+    @Slot(object)
+    def _apply_recovery_target(self, payload):
+        process_name = str(payload.get("process_name") or "").strip()
+        pid = self._to_int(str(payload.get("pid") or 0))
+        changed = False
+        started = False
+        if process_name and pid > 0:
+            changed = self.set_target(process_name, pid=pid)
+            if not changed and self._prefer_process_name_match:
+                self._prefer_process_name_match = False
+                self.target_changed.emit(self.target_description())
+                self._emit_capture_identity(f"Requested: {self.target_description()}")
+                changed = True
+
+            if changed:
+                self.start_capture(force_restart=True)
+                started = True
+            elif self._process.state() == QProcess.ProcessState.NotRunning:
+                self.start_capture()
+                started = True
+
+        payload["changed"] = changed
+        payload["started"] = started
+        payload["applied"] = bool(process_name and pid > 0 and (changed or started or self._target_pid == pid))
+        done_event = payload.get("done_event")
+        if hasattr(done_event, "set"):
+            done_event.set()
+
+    def _restart_capture_sync(self, prefer_process_name: bool = False) -> dict[str, bool]:
+        payload = {
+            "prefer_process_name": prefer_process_name,
+            "applied": False,
+            "restarted": False,
+        }
+        if QThread.currentThread() == self.thread():
+            self._restart_capture_with_mode(payload)
+            return payload
+        done_event = threading.Event()
+        payload["done_event"] = done_event
+        self._recovery_apply_requested.emit(payload)
+        done_event.wait(3.0)
+        return payload
+
+    @Slot(object)
+    def _restart_capture_with_mode(self, payload):
+        prefer_process_name = bool(payload.get("prefer_process_name"))
+        restarted = False
+        had_target = bool(self._target_process or self._target_pid)
+        if had_target:
+            if prefer_process_name and self._target_process:
+                if not self._prefer_process_name_match:
+                    self._prefer_process_name_match = True
+                    self.target_changed.emit(self.target_description())
+                    self._emit_capture_identity(f"Requested: {self.target_description()}")
+                self.start_capture(force_restart=True)
+                restarted = True
+            elif self._process.state() == QProcess.ProcessState.NotRunning:
+                self.start_capture()
+                restarted = True
+            else:
+                self.start_capture(force_restart=True)
+                restarted = True
+        payload["restarted"] = restarted
+        payload["applied"] = had_target and restarted
+        done_event = payload.get("done_event")
+        if hasattr(done_event, "set"):
+            done_event.set()
 
     def _resolve_executable(self) -> Path:
         if self._executable.exists():
