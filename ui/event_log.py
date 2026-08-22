@@ -276,6 +276,7 @@ class EventLogWidget(QWidget):
         row.delete_requested.connect(self.event_delete_requested.emit)
         self._rows.insert(0, row)
         self._list_layout.insertWidget(0, row)
+        self._total_count += 1
         self._refresh_state()
 
     def append_history(self, events: list[LagEvent]):
@@ -287,6 +288,10 @@ class EventLogWidget(QWidget):
             row.clicked.connect(self._on_row_clicked)
             row.delete_requested.connect(self.event_delete_requested.emit)
             self._list_layout.insertWidget(self._list_layout.count() - 1, row)
+        self._refresh_state()
+
+    def set_total_count(self, count: int):
+        self._total_count = max(0, int(count), len(self._rows))
         self._refresh_state()
 
     def upsert_event(self, event: LagEvent):

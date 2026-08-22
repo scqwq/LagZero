@@ -1122,6 +1122,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_event_count_loaded(self, count: int):
+        self._event_log.set_total_count(count)
         self._event_count_label.setText(f"已记录 {count} 个事件")
 
     @Slot(str)
@@ -1153,7 +1154,7 @@ class MainWindow(QMainWindow):
     @Slot(list)
     def _on_history_loaded(self, events: list[LagEvent]):
         self._event_log.append_history(events)
-        self._history_offset = len(events)
+        self._history_offset += len(events)
 
     def _load_more_history(self):
         if self._history_loading:

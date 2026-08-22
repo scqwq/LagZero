@@ -426,7 +426,6 @@ class PresentMonBridge(QObject):
         self._parser_thread = QThread(self)
         self._parser = _PresentMonParser()
         self._parser.moveToThread(self._parser_thread)
-        self._parser.sample_parsed.connect(self._on_sample_parsed)
         self._parser.metrics_ready.connect(self._on_metrics_ready)
         self._parser.header_seen.connect(self._on_header_seen)
         self._parser_reset_requested.connect(self._parser.reset_stream)
@@ -787,13 +786,10 @@ class PresentMonBridge(QObject):
         self._set_status(f"Capturing {self.target_description()}")
 
     @Slot(object)
-    def _on_sample_parsed(self, sample: FrameSample):
-        self._received_frame = True
-        self._last_failure_reason = ""
-
-    @Slot(object)
     def _on_metrics_ready(self, metrics: FrameMetricsSnapshot):
         self._last_metrics_ts = metrics.updated_at
+        self._received_frame = True
+        self._last_failure_reason = ""
         self._emit_capture_identity(
             f"Captured: {metrics.target_process or 'unknown'} (PID {metrics.process_id})"
         )
