@@ -47,6 +47,8 @@ ui/
 
 **实时指标窗口是时间窗口不是帧数窗口**（本轮修复）：`_PresentMonParser._recent_frames` 曾是 `deque(maxlen=180)`——240fps 下 0.75 秒，但 20fps 下 9 秒，低帧率游戏的 FPS/均值/P95 面板滞后十几秒才反映变化。现在 `METRICS_WINDOW_S = 2.0` 秒时间窗口（deque maxlen=4096 兜底防失控），`_trim_recent_frames()` 按解析时刻墙钟裁剪，任何帧率下面板滞后 ≤ ~2.2 秒。
 
+**逐帧数据不得回 UI 线程**（本轮修复）：`_PresentMonParser.sample_parsed` 曾额外连接到主线程 `PresentMonBridge._on_sample_parsed()`，而该槽只维护 `_received_frame` / `_last_failure_reason` 两个状态。240fps 下这会每秒向 GUI 事件队列投递 240 个跨线程事件，鼠标/重绘/报告切换被排队事件挤压，表现为界面偶发顿挫。现在这条连接已删除；接收状态在每 200ms 一次的 `metrics_ready` 回调中维护。`sample_parsed` 到 `FrameStutterDetector.ingest_frame()` 的逐帧链路保持不变，帧检测、基线学习和归因不受影响。
+
 ## 探测数据
 
 **高精度模式（PresentMon `--v2_metrics`，本轮已切换）**，23 列，解析后进 `FrameSample`（`core/models.py`）：
