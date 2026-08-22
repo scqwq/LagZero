@@ -12,6 +12,7 @@ Layout:
   └────────────────────┴─────────────────────────────────┘
 """
 from datetime import datetime
+from collections import OrderedDict
 from time import monotonic
 
 import threading
@@ -50,6 +51,8 @@ ACCENT = "#58a6ff"
 COMPAT_RECOVERY_METRICS_REQUIRED = 6
 AUTO_HIGH_PRECISION_RECOVERY_INTERVAL_MS = 20000
 AUTO_HIGH_PRECISION_RECOVERY_COOLDOWN_S = 30.0
+SNAPSHOT_CACHE_LIMIT = 24
+HISTORY_PAGE_SIZE = 30
 # Tray balloons: one per category per this window. Events still land in the
 # log; only the popup is throttled.
 TRAY_NOTIFY_CATEGORY_COOLDOWN_S = 120.0
@@ -165,6 +168,7 @@ class MainWindow(QMainWindow):
     # SQLAlchemy on the GUI thread.
     event_persisted = Signal(object, int, object, int)
     event_count_loaded = Signal(int)
+    history_loaded = Signal(list)
 
     def __init__(
         self,
@@ -206,7 +210,9 @@ class MainWindow(QMainWindow):
         self._recovery_in_progress = False
         self._pending_frame_metrics: FrameMetricsSnapshot | None = None
         self._pending_compat_metrics: CompatibilityMetricsSnapshot | None = None
-        self._snapshot_cache: dict[int, LagSnapshot | None] = {}
+        self._snapshot_cache: OrderedDict[int, LagSnapshot | None] = OrderedDict()
+        self._history_offset = 0
+        self._history_loading = False
         self._selected_event_id: int | None = None
         self._selected_event_ref: LagEvent | None = None
         self._last_metrics_ui_ts = 0.0
@@ -245,6 +251,10 @@ class MainWindow(QMainWindow):
         self._candidate_debounce_timer = QTimer(self)
         self._candidate_debounce_timer.setSingleShot(True)
         self._candidate_debounce_timer.timeout.connect(self._apply_deferred_candidates)
+        self._selection_load_timer = QTimer(self)
+        self._selection_load_timer.setSingleShot(True)
+        self._selection_load_timer.setInterval(80)
+        self._selection_load_timer.timeout.connect(self._load_selected_event)
         self._auto_recover_timer = QTimer(self)
         self._auto_recover_timer.timeout.connect(self._maybe_auto_recover_high_precision)
         self._auto_recover_timer.start(AUTO_HIGH_PRECISION_RECOVERY_INTERVAL_MS)
@@ -387,6 +397,7 @@ class MainWindow(QMainWindow):
         self._engine.lag_ended.connect(self._on_lag_ended)
         self._engine.baseline_updated.connect(self._on_baseline_updated)
         self._event_log.event_selected.connect(self._on_event_selected)
+        self._event_log.more_history_requested.connect(self._load_more_history)
         self._event_log.event_delete_requested.connect(self._on_event_delete_requested)
         self._event_log.clear_all_requested.connect(self._on_clear_all_events_requested)
         self._report_lang_combo.currentIndexChanged.connect(self._on_report_language_changed)
@@ -402,6 +413,7 @@ class MainWindow(QMainWindow):
         self.snapshot_loaded.connect(self._on_snapshot_loaded)
         self.event_persisted.connect(self._on_event_persisted)
         self.event_count_loaded.connect(self._on_event_count_loaded)
+        self.history_loaded.connect(self._on_history_loaded)
         if self._session_detector is not None:
             self._session_detector.session_changed.connect(self._on_session_changed)
             self._session_detector.candidates_changed.connect(self._on_candidates_changed)
@@ -563,12 +575,25 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_event_selected(self, event: LagEvent):
         self._selected_event_ref = event
+        self._selected_event_id = event.id
+        self._selection_load_timer.start()
+
+    def _cache_snapshot(self, event_id: int, snapshot: LagSnapshot | None):
+        self._snapshot_cache[event_id] = snapshot
+        self._snapshot_cache.move_to_end(event_id)
+        while len(self._snapshot_cache) > SNAPSHOT_CACHE_LIMIT:
+            self._snapshot_cache.popitem(last=False)
+
+    def _load_selected_event(self):
+        event = self._selected_event_ref
+        if event is None:
+            return
         event_id = event.id
-        self._selected_event_id = event_id
         if event.is_pending or event_id is None:
             self._detail_panel.show_loading_event(event)
             return
         if event_id and event_id in self._snapshot_cache:
+            self._snapshot_cache.move_to_end(event_id)
             self._detail_panel.show_event(event, self._snapshot_cache[event_id])
             return
         self._detail_panel.show_loading_event(event)
@@ -583,7 +608,7 @@ class MainWindow(QMainWindow):
     def _on_snapshot_loaded(self, event: LagEvent, snapshot: LagSnapshot | None):
         event_id = event.id
         if event_id:
-            self._snapshot_cache[event_id] = snapshot
+            self._cache_snapshot(event_id, snapshot)
         if event_id != self._selected_event_id:
             return
         self._detail_panel.show_event(event, snapshot)
@@ -853,17 +878,15 @@ class MainWindow(QMainWindow):
         if candidates_key == self._window_candidates_key:
             return
         self._window_candidates_key = candidates_key
-        previous_key = None
-        index = self._candidate_combo.currentIndex()
-        if 0 <= index < len(self._window_candidates):
-            selected = self._window_candidates[index]
-            previous_key = (selected.hwnd, selected.pid, selected.process_name)
         self._window_candidates = candidates
         self._candidate_combo.blockSignals(True)
         self._candidate_combo.clear()
         if not candidates:
             self._candidate_combo.addItem("没有候选窗口")
         else:
+            current_session = None
+            if self._auto_attach and self._session_detector is not None:
+                current_session = getattr(self._session_detector, "_last_key", None)
             restore_index = 0
             for candidate in candidates:
                 label = (
@@ -871,8 +894,8 @@ class MainWindow(QMainWindow):
                     f"({candidate.width}x{candidate.height})"
                 )
                 self._candidate_combo.addItem(label)
-                current_key = (candidate.hwnd, candidate.pid, candidate.process_name)
-                if previous_key and current_key == previous_key:
+                current_key = (candidate.pid, candidate.hwnd, candidate.process_name)
+                if self._auto_attach and current_session and current_key == current_session:
                     restore_index = self._candidate_combo.count() - 1
             self._candidate_combo.setCurrentIndex(restore_index)
         self._candidate_combo.blockSignals(False)
@@ -1085,8 +1108,8 @@ class MainWindow(QMainWindow):
         event.id = event_id
         if snapshot is not None:
             snapshot.id = snapshot_id
-            self._snapshot_cache[event_id] = snapshot
-        if self._selected_event_ref is event:
+            self._cache_snapshot(event_id, snapshot)
+        if self._selected_event_ref is event and not self._selection_load_timer.isActive():
             self._selected_event_id = event_id
             self._detail_panel.show_event(event, snapshot)
 
@@ -1115,11 +1138,35 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _load_history(self):
-        events = self._storage.get_recent_events(limit=120)
-        for e in reversed(events):
-            self._event_log.add_event(e)
-        count = self._storage.event_count()
-        self._event_count_label.setText(f"已记录 {count} 个事件")
+        self._history_offset = 0
+        self._history_loading = False
+        self._event_log.clear_events()
+
+        def _worker():
+            count = self._storage.event_count()
+            events = self._storage.get_recent_events(limit=HISTORY_PAGE_SIZE)
+            self.history_loaded.emit(events)
+            self.event_count_loaded.emit(count)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(list)
+    def _on_history_loaded(self, events: list[LagEvent]):
+        self._event_log.append_history(events)
+        self._history_offset = len(events)
+
+    def _load_more_history(self):
+        if self._history_loading:
+            return
+        self._history_loading = True
+
+        def _worker():
+            events = self._storage.get_recent_events(
+                limit=HISTORY_PAGE_SIZE, offset=self._history_offset
+            )
+            self.history_loaded.emit(events)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     @Slot()
     def _flush_frame_metrics(self):

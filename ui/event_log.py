@@ -189,11 +189,14 @@ class EventLogWidget(QWidget):
     event_selected = Signal(object)   # LagEvent
     event_delete_requested = Signal(object)  # LagEvent
     clear_all_requested = Signal()
+    more_history_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows: list[EventRow] = []
         self._selected_row: EventRow | None = None
+        self._total_count = 0
+        self._loading_more = False
         self._build()
 
     def _build(self):
@@ -242,6 +245,9 @@ class EventLogWidget(QWidget):
         # Scroll area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        self._scroll_bar = scroll.verticalScrollBar()
+        self._scroll_bar.rangeChanged.connect(self._maybe_request_more_history)
+        self._scroll_bar.valueChanged.connect(self._maybe_request_more_history)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
 
@@ -272,6 +278,17 @@ class EventLogWidget(QWidget):
         self._list_layout.insertWidget(0, row)
         self._refresh_state()
 
+    def append_history(self, events: list[LagEvent]):
+        """Append one older history page, keeping newest rows at the top."""
+        self._loading_more = False
+        for event in events:
+            self._rows.append(EventRow(event))
+            row = self._rows[-1]
+            row.clicked.connect(self._on_row_clicked)
+            row.delete_requested.connect(self.event_delete_requested.emit)
+            self._list_layout.insertWidget(self._list_layout.count() - 1, row)
+        self._refresh_state()
+
     def upsert_event(self, event: LagEvent):
         for row in self._rows:
             if row._lag_event is event or (event.id and row._lag_event.id == event.id):
@@ -286,6 +303,7 @@ class EventLogWidget(QWidget):
                 if self._selected_row is row:
                     self._selected_row = None
                 self._rows.remove(row)
+                self._total_count = max(0, self._total_count - 1)
                 row.setParent(None)
                 row.deleteLater()
                 self._refresh_state()
@@ -297,6 +315,8 @@ class EventLogWidget(QWidget):
             row.setParent(None)
             row.deleteLater()
         self._rows.clear()
+        self._total_count = 0
+        self._loading_more = False
         self._selected_row = None
         self._refresh_state()
 
@@ -313,7 +333,14 @@ class EventLogWidget(QWidget):
         self.event_selected.emit(event)
 
     def _refresh_state(self):
-        count = len(self._rows)
-        self._count_label.setText(str(count))
-        self._empty_label.setVisible(count == 0)
-        self._clear_all_btn.setEnabled(count > 0)
+        self._count_label.setText(str(self._total_count))
+        self._empty_label.setVisible(self._total_count == 0)
+        self._clear_all_btn.setEnabled(self._total_count > 0)
+
+    def _maybe_request_more_history(self):
+        if self._loading_more or len(self._rows) >= self._total_count:
+            return
+        bar = self._scroll_bar
+        if bar.maximum() - bar.value() <= 120:
+            self._loading_more = True
+            self.more_history_requested.emit()

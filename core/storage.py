@@ -245,11 +245,12 @@ class Storage:
     # Read
     # ------------------------------------------------------------------
 
-    def get_recent_events(self, limit: int = 100) -> list[LagEvent]:
+    def get_recent_events(self, limit: int = 100, offset: int = 0) -> list[LagEvent]:
         with Session(self._engine) as session:
             stmt = (
                 select(LagEventRow)
                 .order_by(LagEventRow.started_at.desc())
+                .offset(offset)
                 .limit(limit)
             )
             rows = session.scalars(stmt).all()
