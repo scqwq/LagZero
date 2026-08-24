@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLabel, QSplitter, QFrame, QProgressBar, QStatusBar,
     QSystemTrayIcon, QMenu, QApplication, QComboBox,
     QLineEdit, QPushButton, QCheckBox,
+    QButtonGroup,
 )
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import QStyle
@@ -315,9 +316,50 @@ class MainWindow(QMainWindow):
         self._probe_result_label.setWordWrap(True)
         self._probe_result_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         top_row.addWidget(self._window_label, stretch=1)
-        top_row.addWidget(self._capture_mode_label)
         top_row.addWidget(self._pm_status_label, stretch=1)
         capture_layout.addLayout(top_row)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+        mode_title = QLabel("采集模式")
+        mode_title.setStyleSheet(f"color: {MUTED}; font-size: 11px; font-weight: 700;")
+        self._high_precision_mode_btn = QPushButton("高精度")
+        self._compatibility_mode_btn = QPushButton("兼容")
+        for button in (self._high_precision_mode_btn, self._compatibility_mode_btn):
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumWidth(88)
+            button.setStyleSheet(f"""
+                QPushButton {{
+                    background: #11161d;
+                    color: {MUTED};
+                    border: 1px solid #30363d;
+                    border-radius: 6px;
+                    padding: 5px 10px;
+                    font-size: 11px;
+                    font-weight: 700;
+                }}
+                QPushButton:hover {{
+                    color: {TEXT};
+                    border-color: #444c56;
+                }}
+                QPushButton:checked {{
+                    background: {ACCENT};
+                    color: {BG};
+                    border-color: {ACCENT};
+                }}
+            """)
+        self._mode_button_group = QButtonGroup(self)
+        self._mode_button_group.setExclusive(True)
+        self._mode_button_group.addButton(self._high_precision_mode_btn)
+        self._mode_button_group.addButton(self._compatibility_mode_btn)
+        self._high_precision_mode_btn.setChecked(True)
+        mode_row.addWidget(mode_title)
+        mode_row.addWidget(self._high_precision_mode_btn)
+        mode_row.addWidget(self._compatibility_mode_btn)
+        mode_row.addStretch()
+        mode_row.addWidget(self._capture_mode_label)
+        capture_layout.addLayout(mode_row)
         capture_layout.addWidget(self._capture_identity_label)
         capture_layout.addWidget(self._capture_diag_label)
         capture_layout.addWidget(self._probe_result_label)
@@ -404,6 +446,8 @@ class MainWindow(QMainWindow):
         self._auto_checkbox.toggled.connect(self._on_auto_toggled)
         self._candidate_combo.currentIndexChanged.connect(self._on_candidate_selected)
         self._apply_target_btn.clicked.connect(self._apply_manual_target)
+        self._high_precision_mode_btn.clicked.connect(self._on_high_precision_mode_requested)
+        self._compatibility_mode_btn.clicked.connect(self._on_compatibility_mode_requested)
         self._clean_sessions_btn.clicked.connect(self._clean_stale_sessions)
         self._probe_btn.clicked.connect(self._probe_active_presents)
         self._recover_btn.clicked.connect(self._recover_high_precision)
@@ -663,6 +707,36 @@ class MainWindow(QMainWindow):
             self._pm_status_label.setText("PresentMon：等待前台游戏")
             self._presentmon.stop_capture()
 
+    @Slot(bool)
+    def _on_compatibility_mode_requested(self, checked: bool):
+        if not checked:
+            self._update_capture_mode_buttons()
+            return
+        if self._compat_active:
+            return
+        self._activate_compatibility_mode("手动切换到兼容模式")
+
+    @Slot(bool)
+    def _on_high_precision_mode_requested(self, checked: bool):
+        if not checked:
+            self._update_capture_mode_buttons()
+            return
+        if not self._compat_active:
+            if self._presentmon is not None:
+                self._presentmon.start_capture()
+            return
+        self._deactivate_compatibility_mode("手动切换回高精度模式")
+        if self._presentmon is not None:
+            target_name, target_pid = self._presentmon.requested_target()
+            if target_name or target_pid:
+                self._presentmon.start_capture()
+            else:
+                self._pm_status_label.setText("PresentMon：等待采集目标")
+
+    def _update_capture_mode_buttons(self):
+        self._high_precision_mode_btn.setChecked(not self._compat_active)
+        self._compatibility_mode_btn.setChecked(self._compat_active)
+
     @Slot(int)
     def _on_candidate_selected(self, index: int):
         if self._auto_attach or index < 0 or index >= len(self._window_candidates):
@@ -690,8 +764,11 @@ class MainWindow(QMainWindow):
         self._presentmon.set_target(target, pid=pid)
         if self._compat_capture is not None:
             self._compat_capture.set_target(target, pid=pid)
-        self._presentmon.start_capture()
-        self._flash_button(self._apply_target_btn, f"已应用采集目标：{self._presentmon.target_description()}")
+        if self._compat_active:
+            self._flash_button(self._apply_target_btn, f"已应用兼容模式目标：{self._compat_capture.target_description() if self._compat_capture is not None else target}")
+        else:
+            self._presentmon.start_capture()
+            self._flash_button(self._apply_target_btn, f"已应用采集目标：{self._presentmon.target_description()}")
 
     @Slot()
     def _clean_stale_sessions(self):
@@ -844,7 +921,8 @@ class MainWindow(QMainWindow):
                 changed = self._presentmon.set_target(session.process_name, pid=session.pid)
                 if self._compat_capture is not None:
                     self._compat_capture.set_target(session.process_name, pid=session.pid)
-                if changed or self._presentmon._process.state() == self._presentmon._process.ProcessState.NotRunning:
+                should_start = changed or self._presentmon._process.state() == self._presentmon._process.ProcessState.NotRunning
+                if should_start and not self._compat_active:
                     self._presentmon.start_capture()
         else:
             target_desc = ""
@@ -1312,11 +1390,14 @@ class MainWindow(QMainWindow):
     def _activate_compatibility_mode(self, reason: str):
         if self._compat_capture is None or self._compat_active:
             return
+        if self._presentmon is not None:
+            self._presentmon.stop_capture()
         self._compat_active = True
         self._compat_recovery_count = 0
         self._capture_mode = "Compatibility"
         self._capture_mode_label.setText("采集模式：兼容模式")
         self._capture_mode_label.setStyleSheet(f"color: {AMBER}; font-size: 12px; font-weight: 700;")
+        self._update_capture_mode_buttons()
         self._set_capture_chip_labels("模式", "响应延迟", "进程 CPU", "IO / 未响应")
         self._last_compat_diag_text = f"诊断：由于高精度采集不可用，已自动切换到兼容模式。\n最近原因：{reason}"
         self._last_compat_diag_ts = monotonic()
@@ -1336,6 +1417,7 @@ class MainWindow(QMainWindow):
         self._capture_mode = "High Precision"
         self._capture_mode_label.setText("采集模式：高精度")
         self._capture_mode_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px; font-weight: 700;")
+        self._update_capture_mode_buttons()
         self._set_capture_chip_labels("FPS", "平均帧时", "P95 帧时", "CPU 等待")
         self._last_compat_debug = "compat_debug=inactive"
         self._last_compat_diag_text = ""
