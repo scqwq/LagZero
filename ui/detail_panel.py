@@ -49,6 +49,7 @@ CAUSE_ICONS = {
     "Responsiveness Stall": "⏱️",
     "CPU Pressure Stall": "🔥",
     "I/O Pressure Stall": "💿",
+    "RESOURCE_PRESSURE_RISK": "⚠️",
     "UNKNOWN": "❓",
 }
 
@@ -81,6 +82,7 @@ CAUSE_COLOURS = {
     "Responsiveness Stall": AMBER,
     "CPU Pressure Stall": RED,
     "I/O Pressure Stall": "#1abc9c",
+    "RESOURCE_PRESSURE_RISK": AMBER,
     "UNKNOWN": MUTED,
 }
 
@@ -113,6 +115,7 @@ CAUSE_LABELS_ZH = {
     "Responsiveness Stall": "响应延迟卡顿",
     "CPU Pressure Stall": "CPU 压力卡顿",
     "I/O Pressure Stall": "IO 压力卡顿",
+    "RESOURCE_PRESSURE_RISK": "资源压力风险",
     "UNKNOWN": "未明确分类",
 }
 
@@ -247,16 +250,30 @@ class DetailPanelWidget(QWidget):
     def _raw_metrics_html(self, snapshot: LagSnapshot) -> str:
         target = snapshot.peak_sample.target_process
         gpu = snapshot.peak_sample.gpu_memory
-        if target is None and gpu is None:
+        has_system_memory = snapshot.peak_sample.ram_total_mb > 0
+        if target is None and gpu is None and not has_system_memory:
             return ""
 
         sections: list[str] = []
+        if has_system_memory:
+            title = "System Memory" if self._report_language == "en" else "系统内存"
+            rows = [
+                self._raw_metric_row("RAM Usage" if self._report_language == "en" else "内存使用率", f"{snapshot.peak_sample.ram_percent:.1f}%"),
+                self._raw_metric_row("Used" if self._report_language == "en" else "已用内存", f"{snapshot.peak_sample.ram_used_mb / 1024:.2f} GB"),
+                self._raw_metric_row("Available" if self._report_language == "en" else "可用内存", f"{snapshot.peak_sample.ram_available_mb / 1024:.2f} GB"),
+                self._raw_metric_row("Total" if self._report_language == "en" else "总内存", f"{snapshot.peak_sample.ram_total_mb / 1024:.2f} GB"),
+            ]
+            sections.append(self._raw_metric_block(title, rows))
+
         if target is not None:
             title = "Target Process" if self._report_language == "en" else "目标进程"
             rows = [
                 self._raw_metric_row("Name" if self._report_language == "en" else "名称", self._escape(target.name)),
                 self._raw_metric_row("PID", str(target.pid)),
-                self._raw_metric_row("CPU", f"{target.cpu_percent:.1f}%"),
+                self._raw_metric_row(
+                    "CPU Share" if self._report_language == "en" else "CPU（整机）",
+                    f"{target.cpu_machine_share:.1f}%",
+                ),
                 self._raw_metric_row("Working Set" if self._report_language == "en" else "进程内存", f"{target.memory_mb:.1f} MB"),
                 self._raw_metric_row("Private Memory", f"{target.private_memory_mb:.1f} MB"),
                 self._raw_metric_row("Read Throughput" if self._report_language == "en" else "读取吞吐", f"{target.read_kb_s:.1f} KB/s"),
@@ -297,7 +314,11 @@ class DetailPanelWidget(QWidget):
         return f'<div style="background:{BG2};border-radius:6px;padding:12px 14px;margin-top:8px;"><table cellspacing="0" cellpadding="0">{"".join(html_rows)}</table></div>'
 
     def _processes_html(self, snapshot: LagSnapshot) -> str:
-        headers = ("PROCESS", "PID", "CPU", "RAM") if self._report_language == "en" else ("进程", "PID", "CPU", "内存")
+        headers = (
+            ("PROCESS", "PID", "CPU SHARE", "RAM")
+            if self._report_language == "en"
+            else ("进程", "PID", "CPU（整机）", "内存")
+        )
         rows = [
             f"<tr>"
             f'<td style="color:{MUTED};font-size:10px;font-weight:700;padding:0 12px 8px 0;">{headers[0]}</td>'
@@ -306,13 +327,14 @@ class DetailPanelWidget(QWidget):
             f'<td style="color:{MUTED};font-size:10px;font-weight:700;padding:0 0 8px 0;">{headers[3]}</td>'
             f"</tr>"
         ]
-        for proc in snapshot.top_processes[:8]:
-            cpu_colour = RED if proc.cpu_percent > 50 else AMBER if proc.cpu_percent > 20 else TEXT
+        for proc in snapshot.top_processes[:32]:
+            cpu_share = proc.cpu_machine_share
+            cpu_colour = RED if cpu_share > 20 else AMBER if cpu_share > 10 else TEXT
             rows.append(
                 f"<tr>"
                 f'<td style="color:{TEXT};font-size:12px;padding:4px 12px 4px 0;">{self._escape(proc.name[:28])}</td>'
                 f'<td style="color:{MUTED};font-size:12px;padding:4px 12px 4px 0;">{proc.pid}</td>'
-                f'<td style="color:{cpu_colour};font-size:12px;font-weight:700;padding:4px 12px 4px 0;">{proc.cpu_percent:.1f}%</td>'
+                f'<td style="color:{cpu_colour};font-size:12px;font-weight:700;padding:4px 12px 4px 0;">{cpu_share:.1f}%</td>'
                 f'<td style="color:{MUTED};font-size:12px;padding:4px 0;">{proc.memory_mb:.0f} MB</td>'
                 f"</tr>"
             )
@@ -464,6 +486,13 @@ class DetailPanelWidget(QWidget):
 
     def _cause_text_zh(self, event: LagEvent, snapshot: LagSnapshot, code: str) -> str:
         top_proc = snapshot.top_processes[0] if snapshot.top_processes else None
+        if code == "RESOURCE_PRESSURE_RISK":
+            available_gb = snapshot.peak_sample.ram_available_mb / 1024.0
+            available_text = f"可用内存约 {available_gb:.2f} GB。" if available_gb > 0 else ""
+            return (
+                "当前尚未检测到明显帧卡顿，但系统资源压力较高，可能影响游戏流畅性。"
+                f"峰值整机 CPU {snapshot.peak_cpu:.1f}%，内存占用 {snapshot.peak_ram:.1f}%。{available_text}"
+            )
         if code in {"CPU_SPIKE", "CPU_BOUND"} and top_proc is not None:
             return f"检测到进程 {top_proc.name} (PID {top_proc.pid}) 的 CPU 占用达到 {top_proc.cpu_percent:.1f}%，很可能它是导致本次卡顿的主要原因。"
         if code == "GPU_BOUND":

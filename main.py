@@ -18,6 +18,8 @@ from PySide6.QtCore import Qt, QThread, QTimer
 
 from core import elevation
 from core.collectors import SystemCollector
+from core.collectors import machine_cpu_count
+from core.pressure import load_settings, select_processes_for_report
 from core.detection import DetectionEngine
 from core.recorder import SnapshotRecorder
 from core.analyzer import CauseAnalyzer
@@ -55,7 +57,22 @@ def main():
     app.setQuitOnLastWindowClosed(False)  # Keep running in tray
 
     # --- Instantiate core components ---
-    collector = SystemCollector(interval=1.0, top_n_processes=8)
+    import psutil
+
+    pressure_settings = load_settings(
+        machine_cpu_count(),
+        psutil.virtual_memory().total / (1024 ** 3),
+    )
+    collector = SystemCollector(
+        interval=1.0,
+        top_n_processes=32,
+        process_selector=lambda processes, target_pid, cpu_count: select_processes_for_report(
+            processes,
+            pressure_settings,
+            target_pid,
+            cpu_count,
+        ),
+    )
     engine    = DetectionEngine()
     recorder  = SnapshotRecorder(pre_lag_seconds=5)
     analyzer  = CauseAnalyzer()
@@ -86,6 +103,7 @@ def main():
         frame_detector=frame_detector,
         compat_capture=compat_capture,
         compat_detector=compat_detector,
+        pressure_settings=pressure_settings,
     )
     window.show()
 

@@ -14,6 +14,7 @@ class ProcessSample:
     cpu_percent: float
     memory_mb: float
     status: str = "running"
+    cpu_machine_share: float = 0.0
 
 
 @dataclass
@@ -35,6 +36,7 @@ class TargetProcessMetrics:
     read_kb_s: float = 0.0
     write_kb_s: float = 0.0
     thread_count: int = 0
+    cpu_machine_share: float = 0.0
 
 
 @dataclass
@@ -58,6 +60,7 @@ class SystemSample:
     ram_total_mb: float
     swap_percent: float
     responsiveness_ms: float    # how long a simple OS op took (ms)
+    ram_available_mb: float = 0.0
     top_processes: list[ProcessSample] = field(default_factory=list)
     process_groups: list[ProcessGroupSample] = field(default_factory=list)
     target_process: Optional[TargetProcessMetrics] = None

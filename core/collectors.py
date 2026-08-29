@@ -116,10 +116,17 @@ class SystemCollector(QThread):
     sample_ready = Signal(object)   # emits SystemSample
     error_occurred = Signal(str)
 
-    def __init__(self, interval: float = 1.0, top_n_processes: int = 10, parent=None):
+    def __init__(
+        self,
+        interval: float = 1.0,
+        top_n_processes: int = 10,
+        process_selector=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.interval = interval
         self.top_n = top_n_processes
+        self._process_selector = process_selector
         self._running = False
         self._collect_count = 0
         self._last_top_processes: list[ProcessSample] = []
@@ -202,6 +209,7 @@ class SystemCollector(QThread):
             ram_percent=vm.percent,
             ram_used_mb=vm.used / (1024 ** 2),
             ram_total_mb=vm.total / (1024 ** 2),
+            ram_available_mb=vm.available / (1024 ** 2),
             swap_percent=swap.percent,
             responsiveness_ms=responsiveness,
             top_processes=processes,
@@ -232,6 +240,7 @@ class SystemCollector(QThread):
                     cpu_percent=info["cpu_percent"] or 0.0,
                     memory_mb=mem_mb,
                     status=info["status"] or "unknown",
+                    cpu_machine_share=per_core_to_machine_share(info["cpu_percent"] or 0.0),
                 ))
                 group_name = BROWSER_PROCESS_GROUPS.get((info["name"] or "").lower())
                 if group_name is not None:
@@ -257,6 +266,12 @@ class SystemCollector(QThread):
             key=lambda group: (group.cpu_machine_share, group.memory_mb),
             reverse=True,
         )
+        if self._process_selector is not None:
+            return self._process_selector(
+                procs,
+                self._tracked_process_pid,
+                machine_cpu_count(),
+            )
         return procs[: self.top_n]
 
     def _collect_tracked_process(self) -> TargetProcessMetrics | None:
@@ -291,6 +306,7 @@ class SystemCollector(QThread):
             read_kb_s=read_kb_s,
             write_kb_s=write_kb_s,
             thread_count=thread_count,
+            cpu_machine_share=per_core_to_machine_share(cpu_percent),
         )
 
     def _resolve_tracked_process(self) -> psutil.Process | None:

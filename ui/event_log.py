@@ -53,6 +53,7 @@ CAUSE_COLOURS = {
     "Responsiveness Stall": AMBER,
     "CPU Pressure Stall":   RED,
     "I/O Pressure Stall":   "#1abc9c",
+    "RESOURCE_PRESSURE_RISK": AMBER,
     "UNKNOWN":              MUTED,
 }
 
@@ -155,6 +156,8 @@ class EventRow(QFrame):
         self._time_label.setText(f"{time_str}  <span style='color:{MUTED};font-size:10px'>{date_str}</span>")
         if self._lag_event.is_pending:
             self._dur_label.setText("正在生成报告")
+        elif self._lag_event.category == "RESOURCE_PRESSURE_RISK":
+            self._dur_label.setText("资源压力提示")
         else:
             self._dur_label.setText(f"{dur}s duration")
         code = self._lag_event.category or self._lag_event.cause_code or "UNKNOWN"

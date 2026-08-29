@@ -181,6 +181,7 @@ class Storage:
                     "pid": p.pid,
                     "cpu_percent": round(p.cpu_percent, 1),
                     "memory_mb": round(p.memory_mb, 1),
+                    "cpu_machine_share": round(p.cpu_machine_share, 1),
                 }
                 for p in snapshot.top_processes
             ])
@@ -199,6 +200,8 @@ class Storage:
                     "ts": s.timestamp.isoformat(),
                     "cpu": round(s.cpu_percent, 1),
                     "ram": round(s.ram_percent, 1),
+                    "ram_available_gb": round(s.ram_available_mb / 1024, 2),
+                    "ram_total_gb": round(s.ram_total_mb / 1024, 2),
                     "resp": round(s.responsiveness_ms, 1),
                     "target_name": s.target_process.name if s.target_process else "",
                     "target_pid": s.target_process.pid if s.target_process else 0,
@@ -220,6 +223,7 @@ class Storage:
                     "read_kb_s": round(snapshot.peak_sample.target_process.read_kb_s, 1),
                     "write_kb_s": round(snapshot.peak_sample.target_process.write_kb_s, 1),
                     "thread_count": snapshot.peak_sample.target_process.thread_count,
+                    "cpu_machine_share": round(snapshot.peak_sample.target_process.cpu_machine_share, 1),
                 }
                 if snapshot.peak_sample.target_process
                 else {}
@@ -341,6 +345,7 @@ class Storage:
                 name=p["name"],
                 cpu_percent=p["cpu_percent"],
                 memory_mb=p["memory_mb"],
+                cpu_machine_share=p.get("cpu_machine_share", 0.0),
             )
             for p in json.loads(row.top_processes_json)
         ]
@@ -380,8 +385,9 @@ class Storage:
                 cpu_per_core=[],
                 ram_percent=s["ram"],
                 ram_used_mb=0,
-                ram_total_mb=0,
+                ram_total_mb=s.get("ram_total_gb", 0.0) * 1024,
                 swap_percent=0,
+                ram_available_mb=s.get("ram_available_gb", 0.0) * 1024,
                 responsiveness_ms=s["resp"],
                 top_processes=[],
                 target_process=target_process,
@@ -399,6 +405,7 @@ class Storage:
                 read_kb_s=target_payload.get("read_kb_s", 0.0),
                 write_kb_s=target_payload.get("write_kb_s", 0.0),
                 thread_count=target_payload.get("thread_count", 0),
+                cpu_machine_share=target_payload.get("cpu_machine_share", 0.0),
             )
         gpu_payload = json.loads(row.gpu_memory_json or "{}")
         gpu_memory = None

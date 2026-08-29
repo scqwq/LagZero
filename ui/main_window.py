@@ -16,6 +16,7 @@ from collections import OrderedDict
 from time import monotonic
 
 import threading
+import psutil
 
 from PySide6.QtCore import Qt, QTimer, Slot, Signal
 from PySide6.QtGui import QFont, QColor, QPalette
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication, QComboBox,
     QLineEdit, QPushButton, QCheckBox,
     QButtonGroup,
+    QTabWidget, QFormLayout, QDoubleSpinBox, QScrollArea,
 )
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import QStyle
@@ -35,6 +37,14 @@ from core.models import (
 )
 from ui.event_log import EventLogWidget
 from ui.detail_panel import DetailPanelWidget
+from core.collectors import machine_cpu_count
+from core.pressure import (
+    PressureAlertScheduler,
+    default_settings,
+    evaluate_pressure,
+    load_settings,
+    save_settings,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +67,8 @@ HISTORY_PAGE_SIZE = 30
 # Tray balloons: one per category per this window. Events still land in the
 # log; only the popup is throttled.
 TRAY_NOTIFY_CATEGORY_COOLDOWN_S = 120.0
+RISK_ALERT_INTERVALS_S = [15.0, 30.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1800.0]
+STUTTER_ALERT_INTERVALS_S = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 MANUAL_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 AUTO_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 
@@ -183,6 +195,7 @@ class MainWindow(QMainWindow):
         frame_detector=None,
         compat_capture=None,
         compat_detector=None,
+        pressure_settings=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -235,6 +248,18 @@ class MainWindow(QMainWindow):
         # rule every few seconds used to raise a balloon each time. Minor
         # events stay in the log; only the first of each kind pops per window.
         self._last_tray_notify_ts: dict[str, float] = {}
+        self._hardware_cpu_count = machine_cpu_count()
+        self._hardware_total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        self._pressure_settings = pressure_settings or load_settings(
+            self._hardware_cpu_count,
+            self._hardware_total_ram_gb,
+        )
+        self._pressure_alert_scheduler = PressureAlertScheduler(RISK_ALERT_INTERVALS_S)
+        self._stutter_pressure_scheduler = PressureAlertScheduler(
+            STUTTER_ALERT_INTERVALS_S,
+            onset_seconds=0.0,
+        )
+        self._last_pressure_findings = []
 
         self.setWindowTitle("LagLense")
 
@@ -278,19 +303,22 @@ class MainWindow(QMainWindow):
         self._status_dot = StatusDot()
         self._baseline_label = QLabel("基线：学习中…")
         self._baseline_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self._pressure_state_label = QLabel("压力：正常")
+        self._pressure_state_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         header.addWidget(title)
         header.addStretch()
-        self._report_lang_combo = QComboBox()
-        self._report_lang_combo.addItem("报告：中文", "zh")
-        self._report_lang_combo.addItem("Report: English", "en")
-        self._report_lang_combo.setCurrentIndex(0)
-        self._report_lang_combo.setMinimumWidth(130)
         header.addWidget(self._baseline_label)
         header.addSpacing(10)
-        header.addWidget(self._report_lang_combo)
-        header.addSpacing(16)
+        header.addWidget(self._pressure_state_label)
         header.addWidget(self._status_dot)
         root.addLayout(header)
+
+        self._main_tabs = QTabWidget()
+        root.addWidget(self._main_tabs)
+        dashboard_page = QWidget()
+        dashboard_layout = QVBoxLayout(dashboard_page)
+        dashboard_layout.setContentsMargins(0, 0, 0, 0)
+        self._main_tabs.addTab(dashboard_page, "面板")
 
         # --- Capture controls ---
         capture_card = QFrame()
@@ -316,50 +344,9 @@ class MainWindow(QMainWindow):
         self._probe_result_label.setWordWrap(True)
         self._probe_result_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         top_row.addWidget(self._window_label, stretch=1)
+        top_row.addWidget(self._capture_mode_label)
         top_row.addWidget(self._pm_status_label, stretch=1)
         capture_layout.addLayout(top_row)
-
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
-        mode_title = QLabel("采集模式")
-        mode_title.setStyleSheet(f"color: {MUTED}; font-size: 11px; font-weight: 700;")
-        self._high_precision_mode_btn = QPushButton("高精度")
-        self._compatibility_mode_btn = QPushButton("兼容")
-        for button in (self._high_precision_mode_btn, self._compatibility_mode_btn):
-            button.setCheckable(True)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setMinimumWidth(88)
-            button.setStyleSheet(f"""
-                QPushButton {{
-                    background: #11161d;
-                    color: {MUTED};
-                    border: 1px solid #30363d;
-                    border-radius: 6px;
-                    padding: 5px 10px;
-                    font-size: 11px;
-                    font-weight: 700;
-                }}
-                QPushButton:hover {{
-                    color: {TEXT};
-                    border-color: #444c56;
-                }}
-                QPushButton:checked {{
-                    background: {ACCENT};
-                    color: {BG};
-                    border-color: {ACCENT};
-                }}
-            """)
-        self._mode_button_group = QButtonGroup(self)
-        self._mode_button_group.setExclusive(True)
-        self._mode_button_group.addButton(self._high_precision_mode_btn)
-        self._mode_button_group.addButton(self._compatibility_mode_btn)
-        self._high_precision_mode_btn.setChecked(True)
-        mode_row.addWidget(mode_title)
-        mode_row.addWidget(self._high_precision_mode_btn)
-        mode_row.addWidget(self._compatibility_mode_btn)
-        mode_row.addStretch()
-        mode_row.addWidget(self._capture_mode_label)
-        capture_layout.addLayout(mode_row)
         capture_layout.addWidget(self._capture_identity_label)
         capture_layout.addWidget(self._capture_diag_label)
         capture_layout.addWidget(self._probe_result_label)
@@ -394,7 +381,7 @@ class MainWindow(QMainWindow):
         self._p95_title, self._p95_value = self._build_capture_chip(telemetry_row, "P95 帧时")
         self._wait_title, self._wait_value = self._build_capture_chip(telemetry_row, "CPU 等待")
         self._set_capture_metrics_unavailable("无数据")
-        root.addWidget(capture_card)
+        dashboard_layout.addWidget(capture_card)
         capture_layout.addLayout(telemetry_row)
 
         # --- Metrics bar ---
@@ -405,7 +392,7 @@ class MainWindow(QMainWindow):
         self._score_bar = MetricBar("卡顿评分", unit="%")
         for w in (self._cpu_bar, self._ram_bar, self._resp_bar, self._score_bar):
             metrics_row.addWidget(w)
-        root.addLayout(metrics_row)
+        dashboard_layout.addLayout(metrics_row)
 
         # --- Splitter: event log | detail panel ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -418,7 +405,8 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._event_log)
         splitter.addWidget(self._detail_panel)
         splitter.setSizes([380, 680])
-        root.addWidget(splitter, stretch=1)
+        dashboard_layout.addWidget(splitter, stretch=1)
+        self._main_tabs.addTab(self._build_settings_page(), "设置")
 
         # --- Status bar ---
         sb = QStatusBar()
@@ -427,6 +415,124 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._event_count_label)
         self.setStatusBar(sb)
         self._set_status_message("正在采集系统数据…", force=True)
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(12)
+
+        report_card, report_layout = self._settings_card("报告")
+        self._report_lang_combo = QComboBox()
+        self._report_lang_combo.addItem("报告：中文", "zh")
+        self._report_lang_combo.addItem("Report: English", "en")
+        self._report_lang_combo.setMinimumWidth(180)
+        report_form = QFormLayout(report_layout)
+        report_form.addRow("报告语言", self._report_lang_combo)
+
+        mode_card, mode_layout = self._settings_card("采集模式")
+        mode_layout.setContentsMargins(12, 12, 12, 12)
+        mode_row = QHBoxLayout()
+        self._high_precision_mode_btn = QPushButton("高精度")
+        self._compatibility_mode_btn = QPushButton("兼容")
+        for button in (self._high_precision_mode_btn, self._compatibility_mode_btn):
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumWidth(110)
+            button.setStyleSheet(f"""
+                QPushButton {{
+                    background: #11161d;
+                    color: {MUTED};
+                    border: 1px solid #30363d;
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                    font-size: 11px;
+                    font-weight: 700;
+                }}
+                QPushButton:hover {{ color: {TEXT}; border-color: #444c56; }}
+                QPushButton:checked {{
+                    background: {ACCENT};
+                    color: {BG};
+                    border-color: {ACCENT};
+                }}
+            """)
+        self._mode_button_group = QButtonGroup(self)
+        self._mode_button_group.setExclusive(True)
+        self._mode_button_group.addButton(self._high_precision_mode_btn)
+        self._mode_button_group.addButton(self._compatibility_mode_btn)
+        self._high_precision_mode_btn.setChecked(not self._compat_active)
+        self._compatibility_mode_btn.setChecked(self._compat_active)
+        mode_row.addWidget(self._high_precision_mode_btn)
+        mode_row.addWidget(self._compatibility_mode_btn)
+        mode_row.addStretch()
+        mode_layout.addLayout(mode_row)
+
+        policy_card, policy_layout = self._settings_card("资源策略")
+        self._allow_foreground_resources_checkbox = QCheckBox("默认允许前台程序占用更多资源")
+        self._allow_foreground_resources_checkbox.setChecked(self._pressure_settings.allow_foreground_high_usage)
+        policy_layout.addWidget(self._allow_foreground_resources_checkbox)
+
+        thresholds_card, thresholds_layout = self._settings_card("压力阈值")
+        thresholds_form = QFormLayout(thresholds_layout)
+        self._threshold_spins: dict[str, QDoubleSpinBox] = {}
+        self._add_threshold_spin(thresholds_form, "系统 CPU（%）", "system_cpu_percent", "%", 1.0, 100.0)
+        self._add_threshold_spin(thresholds_form, "可用内存警告线（GB）", "ram_available_warning_gb", " GB", 0.1, 256.0)
+        self._add_threshold_spin(thresholds_form, "后台单进程 CPU（%）", "background_process_cpu_percent", "%", 0.1, 100.0)
+        self._add_threshold_spin(thresholds_form, "后台总 CPU（%）", "background_total_cpu_percent", "%", 0.1, 100.0)
+        self._add_threshold_spin(thresholds_form, "前台进程 CPU（%）", "foreground_process_cpu_percent", "%", 0.1, 100.0)
+        self._add_threshold_spin(thresholds_form, "后台单进程内存（GB）", "background_process_ram_gb", " GB", 0.1, 256.0)
+        self._add_threshold_spin(thresholds_form, "前台进程内存（GB）", "foreground_process_ram_gb", " GB", 0.1, 256.0)
+
+        actions_row = QHBoxLayout()
+        actions_row.addStretch()
+        self._reset_thresholds_btn = QPushButton("恢复默认阈值")
+        self._reset_thresholds_btn.clicked.connect(self._reset_pressure_settings)
+        actions_row.addWidget(self._reset_thresholds_btn)
+        thresholds_layout.addLayout(actions_row)
+
+        for card in (report_card, mode_card, policy_card, thresholds_card):
+            layout.addWidget(card)
+        layout.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        return page
+
+    def _settings_card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
+        card = QFrame()
+        card.setStyleSheet(f"background: {BG2}; border-radius: 8px;")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 12, 12, 12)
+        label = QLabel(title)
+        label.setStyleSheet(f"color: {MUTED}; font-size: 11px; font-weight: 700;")
+        layout.addWidget(label)
+        return card, layout
+
+    def _add_threshold_spin(
+        self,
+        form: QFormLayout,
+        label: str,
+        field: str,
+        suffix: str,
+        minimum: float,
+        maximum: float,
+    ) -> None:
+        spin = QDoubleSpinBox()
+        spin.setDecimals(1)
+        spin.setSingleStep(0.1)
+        spin.setRange(minimum, maximum)
+        spin.setSuffix(suffix)
+        spin.setValue(getattr(self._pressure_settings, field))
+        spin.valueChanged.connect(lambda value, field=field: self._on_pressure_threshold_changed(field, value))
+        self._threshold_spins[field] = spin
+        form.addRow(label, spin)
 
     # ------------------------------------------------------------------
     # Signals
@@ -443,6 +549,7 @@ class MainWindow(QMainWindow):
         self._event_log.event_delete_requested.connect(self._on_event_delete_requested)
         self._event_log.clear_all_requested.connect(self._on_clear_all_events_requested)
         self._report_lang_combo.currentIndexChanged.connect(self._on_report_language_changed)
+        self._allow_foreground_resources_checkbox.toggled.connect(self._on_foreground_policy_changed)
         self._auto_checkbox.toggled.connect(self._on_auto_toggled)
         self._candidate_combo.currentIndexChanged.connect(self._on_candidate_selected)
         self._apply_target_btn.clicked.connect(self._apply_manual_target)
@@ -494,10 +601,85 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_sample(self, sample: SystemSample):
         self._last_system_sample = sample
+        pressure = evaluate_pressure(
+            sample,
+            self._pressure_settings,
+            self._hardware_cpu_count,
+        )
+        self._last_pressure_findings = pressure.findings
+        should_alert = self._pressure_alert_scheduler.update(pressure)
+        state_map = {
+            "normal": "正常",
+            "active": "压力",
+            "recover": "恢复中",
+        }
+        state = self._pressure_alert_scheduler.state
+        self._pressure_state_label.setText(f"压力：{state_map.get(state, state)}")
+        if self._pending_frame_event is not None:
+            stutter_alert = self._stutter_pressure_scheduler.update(pressure)
+            if stutter_alert:
+                self._set_status_message(
+                    "卡顿期间资源压力较高：" + "；".join(
+                        finding.message for finding in pressure.findings
+                    ),
+                    force=True,
+                )
+                if self._tray and self._tray.isVisible():
+                    self._tray.showMessage(
+                        "卡顿期间资源压力较高",
+                        "；".join(finding.message for finding in pressure.findings)[:160],
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        3000,
+                    )
+        elif should_alert:
+            self._record_pressure_risk(sample, pressure.findings)
         score_obj = self._engine.recent_scores[-1] if self._engine.recent_scores else None
         composite = score_obj.composite if score_obj else 0.0
         self._recorder.record_sample(sample, composite)
         self._engine.ingest(sample)
+
+    def _record_pressure_risk(self, sample: SystemSample, findings: list) -> None:
+        if not findings:
+            return
+        peak_ratio = max(finding.ratio for finding in findings)
+        event = LagEvent(
+            id=None,
+            started_at=sample.timestamp,
+            ended_at=sample.timestamp,
+            peak_composite_score=min(1.0, peak_ratio / 2.0),
+            cause="；".join(finding.message for finding in findings),
+            cause_code="RESOURCE_PRESSURE_RISK",
+            category="RESOURCE_PRESSURE_RISK",
+            scope="LOCAL",
+            duration_seconds=0.0,
+            is_pending=False,
+        )
+        snapshot = LagSnapshot(
+            id=None,
+            event_id=None,
+            captured_at=sample.timestamp,
+            pre_lag_samples=[],
+            peak_sample=sample,
+            top_processes=sample.top_processes,
+            peak_cpu=sample.cpu_percent,
+            peak_ram=sample.ram_percent,
+            peak_responsiveness_ms=sample.responsiveness_ms,
+            process_groups=sample.process_groups,
+        )
+        self._persist_event_async(event, snapshot)
+        self._event_log.upsert_event(event)
+        self._refresh_event_count_async()
+        self._set_status_message(
+            "资源压力风险：当前尚未检测到明显帧卡顿，但系统资源占用较高。",
+            force=True,
+        )
+        if self._tray and self._tray.isVisible():
+            self._tray.showMessage(
+                "资源压力风险",
+                "尚未检测到明显帧卡顿，但系统资源占用较高，可能影响游戏流畅性。",
+                QSystemTrayIcon.MessageIcon.Warning,
+                4000,
+            )
 
     @Slot(object)
     def _on_score(self, score: LagScore):
@@ -529,6 +711,11 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_lag_started(self, started_at: datetime):
+        # System metrics alone indicate pressure, not player-visible stutter.
+        # Resource pressure is reported by the pressure scheduler; lag events
+        # are reserved for frame/response detector evidence.
+        return
+
         self._active_event = LagEvent(
             id=None,
             started_at=started_at,
@@ -698,6 +885,32 @@ class MainWindow(QMainWindow):
         if not language:
             language = "zh"
         self._detail_panel.set_report_language(str(language))
+
+    @Slot(bool)
+    def _on_foreground_policy_changed(self, enabled: bool):
+        self._pressure_settings.allow_foreground_high_usage = enabled
+        save_settings(self._pressure_settings)
+
+    @Slot(str, float)
+    def _on_pressure_threshold_changed(self, field: str, value: float):
+        setattr(self._pressure_settings, field, value)
+        save_settings(self._pressure_settings)
+
+    @Slot()
+    def _reset_pressure_settings(self):
+        self._pressure_settings = default_settings(
+            self._hardware_cpu_count,
+            self._hardware_total_ram_gb,
+        )
+        for field, spin in self._threshold_spins.items():
+            spin.blockSignals(True)
+            spin.setValue(getattr(self._pressure_settings, field))
+            spin.blockSignals(False)
+        self._allow_foreground_resources_checkbox.setChecked(
+            self._pressure_settings.allow_foreground_high_usage
+        )
+        save_settings(self._pressure_settings)
+        self._set_status_message("已恢复默认压力阈值", force=True)
 
     @Slot(bool)
     def _on_auto_toggled(self, enabled: bool):
@@ -1113,6 +1326,7 @@ class MainWindow(QMainWindow):
             scope="UNDETERMINED",
             is_pending=True,
         )
+        self._stutter_pressure_scheduler.reset()
         self._event_log.upsert_event(self._pending_frame_event)
         self.statusBar().showMessage(f"帧时间卡顿开始于 {started_at.strftime('%H:%M:%S')}")
 
@@ -1147,6 +1361,11 @@ class MainWindow(QMainWindow):
             episode, peak_sample, snapshot.pre_lag_samples
         )
         event.cause = verdict.explanation
+        if self._last_pressure_findings:
+            pressure_summary = "；".join(
+                finding.message for finding in self._last_pressure_findings
+            )
+            event.cause = f"{event.cause} 卡顿期间资源压力：{pressure_summary}".strip()
         event.category = verdict.category
         event.cause_code = verdict.category
         event.scope = verdict.scope
@@ -1167,6 +1386,7 @@ class MainWindow(QMainWindow):
             f"已记录 {event.category} — 峰值 {episode.peak_frame_time_ms:.1f} ms"
         )
         self._pending_frame_event = None
+        self._last_pressure_findings = []
 
     def _persist_event_async(self, event: LagEvent, snapshot: LagSnapshot | None):
         """Write event + snapshot on a daemon thread; apply ids when done."""
