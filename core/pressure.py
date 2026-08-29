@@ -116,7 +116,7 @@ class PressureAlertScheduler:
         self.last_alert_at = None
         self.recovery_since = None
 
-
+# 剩余总RAM 警告
 def ram_available_warning_gb(total_ram_gb: float) -> float:
     if total_ram_gb <= 16:
         return max(0.5, total_ram_gb * 0.065)
@@ -124,23 +124,23 @@ def ram_available_warning_gb(total_ram_gb: float) -> float:
         return 1.0 + (total_ram_gb - 16) * 0.125
     return 3.0 + (total_ram_gb - 32) * 0.15
 
-
+# 后台单个进程RAM
 def background_process_ram_threshold_gb(total_ram_gb: float) -> float:
     return 1.0 + 6.0 * (1.0 - math.exp(-total_ram_gb / 24.0))
 
-
+# 前台RAM
 def foreground_process_ram_threshold_gb(total_ram_gb: float) -> float:
     return 1.5 + 8.0 * (1.0 - math.exp(-total_ram_gb / 24.0))
 
-
+# 单个进程CPU占用
 def background_process_cpu_threshold_percent(logical_cpu_count: int) -> float:
     return 8.0 + 12.0 * math.exp(-logical_cpu_count / 12.0)
 
-
+# 后台总CPU
 def background_total_cpu_threshold_percent(logical_cpu_count: int) -> float:
-    return 15.0 + 10.0 * math.exp(-logical_cpu_count / 16.0)
+    return 25.0 + 20.0 * math.exp(-logical_cpu_count / 16.0)
 
-
+# 前台CPU
 def foreground_process_cpu_threshold_percent(logical_cpu_count: int) -> float:
     return 35.0 + 15.0 * math.exp(-logical_cpu_count / 16.0)
 

@@ -437,7 +437,8 @@ class MainWindow(QMainWindow):
         self._report_lang_combo.addItem("报告：中文", "zh")
         self._report_lang_combo.addItem("Report: English", "en")
         self._report_lang_combo.setMinimumWidth(180)
-        report_form = QFormLayout(report_layout)
+        report_form = QFormLayout()
+        report_layout.addLayout(report_form)
         report_form.addRow("报告语言", self._report_lang_combo)
 
         mode_card, mode_layout = self._settings_card("采集模式")
@@ -483,7 +484,8 @@ class MainWindow(QMainWindow):
         policy_layout.addWidget(self._allow_foreground_resources_checkbox)
 
         thresholds_card, thresholds_layout = self._settings_card("压力阈值")
-        thresholds_form = QFormLayout(thresholds_layout)
+        thresholds_form = QFormLayout()
+        thresholds_layout.addLayout(thresholds_form)
         self._threshold_spins: dict[str, QDoubleSpinBox] = {}
         self._add_threshold_spin(thresholds_form, "系统 CPU（%）", "system_cpu_percent", "%", 1.0, 100.0)
         self._add_threshold_spin(thresholds_form, "可用内存警告线（GB）", "ram_available_warning_gb", " GB", 0.1, 256.0)
