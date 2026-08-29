@@ -64,6 +64,7 @@ class SnapshotRecorder:
             pre_lag_samples=pre_samples,
             peak_sample=peak,
             top_processes=peak.top_processes,
+            process_groups=peak.process_groups,
             peak_cpu=peak.cpu_percent,
             peak_ram=peak.ram_percent,
             peak_responsiveness_ms=peak.responsiveness_ms,

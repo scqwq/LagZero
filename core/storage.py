@@ -99,6 +99,7 @@ class LagSnapshotRow(Base):
     peak_ram = Column(Float, default=0.0)
     peak_responsiveness_ms = Column(Float, default=0.0)
     top_processes_json = Column(Text, default="[]")    # JSON list of {name, pid, cpu, mem}
+    process_groups_json = Column(Text, default="[]")   # JSON list of aggregated process groups
     pre_lag_summary_json = Column(Text, default="[]")  # JSON list of {ts, cpu, ram, resp}
     target_process_json = Column(Text, default="{}")
     gpu_memory_json = Column(Text, default="{}")
@@ -138,6 +139,8 @@ class Storage:
                 conn.exec_driver_sql("ALTER TABLE lag_snapshots ADD COLUMN target_process_json TEXT DEFAULT '{}'")
             if "gpu_memory_json" not in snapshot_existing:
                 conn.exec_driver_sql("ALTER TABLE lag_snapshots ADD COLUMN gpu_memory_json TEXT DEFAULT '{}'")
+            if "process_groups_json" not in snapshot_existing:
+                conn.exec_driver_sql("ALTER TABLE lag_snapshots ADD COLUMN process_groups_json TEXT DEFAULT '[]'")
 
     # ------------------------------------------------------------------
     # Write
@@ -180,6 +183,15 @@ class Storage:
                     "memory_mb": round(p.memory_mb, 1),
                 }
                 for p in snapshot.top_processes
+            ])
+            groups_json = json.dumps([
+                {
+                    "name": group.name,
+                    "process_count": group.process_count,
+                    "cpu_machine_share": round(group.cpu_machine_share, 1),
+                    "memory_mb": round(group.memory_mb, 1),
+                }
+                for group in snapshot.process_groups
             ])
 
             pre_json = json.dumps([
@@ -232,6 +244,7 @@ class Storage:
                 peak_ram=snapshot.peak_ram,
                 peak_responsiveness_ms=snapshot.peak_responsiveness_ms,
                 top_processes_json=procs_json,
+                process_groups_json=groups_json,
                 pre_lag_summary_json=pre_json,
                 target_process_json=target_json,
                 gpu_memory_json=gpu_json,
@@ -321,7 +334,7 @@ class Storage:
 
     @staticmethod
     def _row_to_snapshot(row: LagSnapshotRow) -> LagSnapshot:
-        from core.models import GpuMemorySnapshot, ProcessSample, SystemSample, TargetProcessMetrics
+        from core.models import GpuMemorySnapshot, ProcessGroupSample, ProcessSample, SystemSample, TargetProcessMetrics
         procs = [
             ProcessSample(
                 pid=p["pid"],
@@ -330,6 +343,15 @@ class Storage:
                 memory_mb=p["memory_mb"],
             )
             for p in json.loads(row.top_processes_json)
+        ]
+        process_groups = [
+            ProcessGroupSample(
+                name=group["name"],
+                process_count=group["process_count"],
+                cpu_machine_share=group["cpu_machine_share"],
+                memory_mb=group["memory_mb"],
+            )
+            for group in json.loads(row.process_groups_json or "[]")
         ]
         # Reconstruct minimal SystemSamples for the timeline chart
         pre_samples = []
@@ -405,10 +427,12 @@ class Storage:
                 swap_percent=0,
                 responsiveness_ms=row.peak_responsiveness_ms,
                 top_processes=procs,
+                process_groups=process_groups,
                 target_process=target_process,
                 gpu_memory=gpu_memory,
             ),
             top_processes=procs,
+            process_groups=process_groups,
             peak_cpu=row.peak_cpu,
             peak_ram=row.peak_ram,
             peak_responsiveness_ms=row.peak_responsiveness_ms,

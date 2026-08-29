@@ -17,6 +17,15 @@ class ProcessSample:
 
 
 @dataclass
+class ProcessGroupSample:
+    """Aggregated resource usage for processes that must be viewed as a group."""
+    name: str
+    process_count: int
+    cpu_machine_share: float
+    memory_mb: float
+
+
+@dataclass
 class TargetProcessMetrics:
     pid: int
     name: str
@@ -50,6 +59,7 @@ class SystemSample:
     swap_percent: float
     responsiveness_ms: float    # how long a simple OS op took (ms)
     top_processes: list[ProcessSample] = field(default_factory=list)
+    process_groups: list[ProcessGroupSample] = field(default_factory=list)
     target_process: Optional[TargetProcessMetrics] = None
     gpu_memory: Optional[GpuMemorySnapshot] = None
 
@@ -98,6 +108,7 @@ class LagSnapshot:
     peak_cpu: float
     peak_ram: float
     peak_responsiveness_ms: float
+    process_groups: list[ProcessGroupSample] = field(default_factory=list)
 
 
 @dataclass

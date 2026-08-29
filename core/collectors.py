@@ -13,11 +13,19 @@ import psutil
 from PySide6.QtCore import QThread, Signal
 
 from core.gpu_stats import query_gpu_memory
-from core.models import SystemSample, ProcessSample, TargetProcessMetrics
+from core.models import SystemSample, ProcessSample, ProcessGroupSample, TargetProcessMetrics
 
 
 PROCESS_REFRESH_INTERVAL = 3
 GPU_REFRESH_INTERVAL = 2
+BROWSER_PROCESS_GROUPS = {
+    "chrome.exe": "Google Chrome",
+    "msedge.exe": "Microsoft Edge",
+    "firefox.exe": "Mozilla Firefox",
+    "brave.exe": "Brave",
+    "vivaldi.exe": "Vivaldi",
+    "opera.exe": "Opera",
+}
 
 # "System Idle Process" (PID 0) accounts for the time the CPU spent doing
 # NOTHING. On an idle machine psutil reports it near 100%, and because the top
@@ -115,6 +123,7 @@ class SystemCollector(QThread):
         self._running = False
         self._collect_count = 0
         self._last_top_processes: list[ProcessSample] = []
+        self._last_process_groups: list = []
         self._tracked_process_name = ""
         self._tracked_process_pid: int | None = None
         self._tracked_process: psutil.Process | None = None
@@ -181,6 +190,7 @@ class SystemCollector(QThread):
         ):
             self._last_top_processes = self._top_processes()
         processes = self._last_top_processes
+        process_groups = self._last_process_groups
         target_process = self._collect_tracked_process()
         if self._collect_count % GPU_REFRESH_INTERVAL == 1 or self._last_gpu_memory is None:
             self._last_gpu_memory = query_gpu_memory()
@@ -195,12 +205,14 @@ class SystemCollector(QThread):
             swap_percent=swap.percent,
             responsiveness_ms=responsiveness,
             top_processes=processes,
+            process_groups=process_groups,
             target_process=target_process,
             gpu_memory=self._last_gpu_memory,
         )
 
     def _top_processes(self) -> list[ProcessSample]:
         procs = []
+        groups: dict[str, dict[str, float]] = {}
         for proc in psutil.process_iter(
             ["pid", "name", "cpu_percent", "memory_info", "status"]
         ):
@@ -209,6 +221,11 @@ class SystemCollector(QThread):
                 if is_idle_pseudo_process(info["pid"], info["name"]):
                     continue
                 mem_mb = (info["memory_info"].rss / (1024 ** 2)) if info["memory_info"] else 0.0
+                private_mb = (
+                    getattr(info["memory_info"], "private", None) / (1024 ** 2)
+                    if info["memory_info"] and getattr(info["memory_info"], "private", None) is not None
+                    else mem_mb
+                )
                 procs.append(ProcessSample(
                     pid=info["pid"],
                     name=info["name"] or "unknown",
@@ -216,11 +233,30 @@ class SystemCollector(QThread):
                     memory_mb=mem_mb,
                     status=info["status"] or "unknown",
                 ))
+                group_name = BROWSER_PROCESS_GROUPS.get((info["name"] or "").lower())
+                if group_name is not None:
+                    group = groups.setdefault(group_name, {"cpu": 0.0, "memory": 0.0, "count": 0})
+                    group["cpu"] += info["cpu_percent"] or 0.0
+                    group["memory"] += private_mb
+                    group["count"] += 1
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
         # Sort by CPU first, then RAM as tiebreaker
         procs.sort(key=lambda p: (p.cpu_percent, p.memory_mb), reverse=True)
+        self._last_process_groups = [
+            ProcessGroupSample(
+                name=name,
+                process_count=int(values["count"]),
+                cpu_machine_share=per_core_to_machine_share(values["cpu"]),
+                memory_mb=values["memory"],
+            )
+            for name, values in groups.items()
+        ]
+        self._last_process_groups.sort(
+            key=lambda group: (group.cpu_machine_share, group.memory_mb),
+            reverse=True,
+        )
         return procs[: self.top_n]
 
     def _collect_tracked_process(self) -> TargetProcessMetrics | None:

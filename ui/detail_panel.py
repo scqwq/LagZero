@@ -218,6 +218,9 @@ class DetailPanelWidget(QWidget):
             if snapshot.top_processes:
                 html.append(self._section_html("Top Processes At Peak" if self._report_language == "en" else "峰值时刻主要进程"))
                 html.append(self._processes_html(snapshot))
+            if snapshot.process_groups:
+                html.append(self._section_html("Browser Groups At Peak" if self._report_language == "en" else "峰值时刻浏览器进程"))
+                html.append(self._process_groups_html(snapshot))
 
         self._browser.setHtml("".join(html))
 
@@ -312,6 +315,32 @@ class DetailPanelWidget(QWidget):
                 f'<td style="color:{cpu_colour};font-size:12px;font-weight:700;padding:4px 12px 4px 0;">{proc.cpu_percent:.1f}%</td>'
                 f'<td style="color:{MUTED};font-size:12px;padding:4px 0;">{proc.memory_mb:.0f} MB</td>'
                 f"</tr>"
+            )
+        return f'<div style="background:{BG2};border-radius:6px;padding:12px 14px;margin-top:8px;"><table cellspacing="0" cellpadding="0">{"".join(rows)}</table></div>'
+
+    def _process_groups_html(self, snapshot: LagSnapshot) -> str:
+        headers = (
+            ("BROWSER", "PROCESSES", "CPU SHARE", "RAM")
+            if self._report_language == "en"
+            else ("浏览器", "进程数", "CPU（整机）", "内存（私有）")
+        )
+        rows = [
+            "<tr>"
+            f'<td style="color:{MUTED};font-size:10px;font-weight:700;padding:0 12px 8px 0;">{headers[0]}</td>'
+            f'<td style="color:{MUTED};font-size:10px;font-weight:700;padding:0 12px 8px 0;">{headers[1]}</td>'
+            f'<td style="color:{MUTED};font-size:10px;font-weight:700;padding:0 12px 8px 0;">{headers[2]}</td>'
+            f'<td style="color:{MUTED};font-size:10px;font-weight:700;padding:0 0 8px 0;">{headers[3]}</td>'
+            "</tr>"
+        ]
+        for group in snapshot.process_groups[:6]:
+            cpu_colour = RED if group.cpu_machine_share > 20 else AMBER if group.cpu_machine_share > 10 else TEXT
+            rows.append(
+                "<tr>"
+                f'<td style="color:{TEXT};font-size:12px;padding:4px 12px 4px 0;">{self._escape(group.name[:28])}</td>'
+                f'<td style="color:{MUTED};font-size:12px;padding:4px 12px 4px 0;">{group.process_count}</td>'
+                f'<td style="color:{cpu_colour};font-size:12px;font-weight:700;padding:4px 12px 4px 0;">{group.cpu_machine_share:.1f}%</td>'
+                f'<td style="color:{MUTED};font-size:12px;padding:4px 0;">{group.memory_mb:.0f} MB</td>'
+                "</tr>"
             )
         return f'<div style="background:{BG2};border-radius:6px;padding:12px 14px;margin-top:8px;"><table cellspacing="0" cellpadding="0">{"".join(rows)}</table></div>'
 
