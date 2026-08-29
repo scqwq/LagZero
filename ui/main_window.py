@@ -42,8 +42,10 @@ from core.pressure import (
     PressureAlertScheduler,
     default_settings,
     evaluate_pressure,
+    frame_resource_context,
     load_settings,
     save_settings,
+    summarize_pressure_findings,
 )
 
 
@@ -647,7 +649,7 @@ class MainWindow(QMainWindow):
             started_at=sample.timestamp,
             ended_at=sample.timestamp,
             peak_composite_score=min(1.0, peak_ratio / 2.0),
-            cause="；".join(finding.message for finding in findings),
+            cause=summarize_pressure_findings(findings),
             cause_code="RESOURCE_PRESSURE_RISK",
             category="RESOURCE_PRESSURE_RISK",
             scope="LOCAL",
@@ -1361,11 +1363,16 @@ class MainWindow(QMainWindow):
             episode, peak_sample, snapshot.pre_lag_samples
         )
         event.cause = verdict.explanation
-        if self._last_pressure_findings:
-            pressure_summary = "；".join(
-                finding.message for finding in self._last_pressure_findings
+        resource_sample = snapshot.peak_sample if snapshot.pre_lag_samples else None
+        if self._last_pressure_findings and resource_sample is not None:
+            resource_context = frame_resource_context(
+                episode,
+                resource_sample,
+                self._last_pressure_findings,
+                self._pressure_settings,
             )
-            event.cause = f"{event.cause} 卡顿期间资源压力：{pressure_summary}".strip()
+            if resource_context:
+                event.cause = f"{event.cause}\n\n{resource_context}"
         event.category = verdict.category
         event.cause_code = verdict.category
         event.scope = verdict.scope

@@ -487,6 +487,8 @@ class DetailPanelWidget(QWidget):
     def _cause_text_zh(self, event: LagEvent, snapshot: LagSnapshot, code: str) -> str:
         top_proc = snapshot.top_processes[0] if snapshot.top_processes else None
         if code == "RESOURCE_PRESSURE_RISK":
+            if event.cause:
+                return event.cause
             available_gb = snapshot.peak_sample.ram_available_mb / 1024.0
             available_text = f"可用内存约 {available_gb:.2f} GB。" if available_gb > 0 else ""
             return (

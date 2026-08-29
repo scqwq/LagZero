@@ -8,7 +8,7 @@ from pathlib import Path
 from time import monotonic
 
 from core.collectors import BROWSER_PROCESS_GROUPS, per_core_to_machine_share
-from core.models import ProcessSample, SystemSample
+from core.models import FrameStutterEpisode, ProcessSample, SystemSample
 
 
 SETTINGS_PATH = Path(__file__).parent.parent / "data" / "pressure_settings.json"
@@ -44,6 +44,23 @@ class PressureFinding:
 class PressureEvaluation:
     findings: list[PressureFinding]
     near_active: bool
+
+
+PRESSURE_FINDING_GROUPS = {
+    "系统压力": {"CPU_PRESSURE_RISK", "RAM_PRESSURE_RISK"},
+    "前台进程压力": {
+        "FOREGROUND_CPU_PRESSURE",
+        "FOREGROUND_RAM_PRESSURE",
+    },
+    "后台进程压力": {
+        "BACKGROUND_PROCESS_CPU_PRESSURE",
+        "BACKGROUND_PROCESS_RAM_PRESSURE",
+    },
+    "浏览器进程组压力": {
+        "BACKGROUND_GROUP_CPU_PRESSURE",
+        "BACKGROUND_GROUP_RAM_PRESSURE",
+    },
+}
 
 
 class PressureAlertScheduler:
@@ -160,6 +177,97 @@ def save_settings(settings: PressureSettings) -> None:
         json.dumps(asdict(settings), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def summarize_pressure_findings(findings: list[PressureFinding]) -> str:
+    """Build a grouped, user-facing summary without implying stutter."""
+    if not findings:
+        return "当前资源压力正常。"
+
+    sections: list[str] = []
+    for title, codes in PRESSURE_FINDING_GROUPS.items():
+        messages = [finding.message for finding in findings if finding.code in codes]
+        if messages:
+            sections.append(f"{title}：" + "；".join(messages))
+
+    parts = ["当前尚未检测到明显帧卡顿，但检测到以下资源压力，可能影响游戏流畅性。"]
+    parts.extend(sections)
+    return "\n".join(parts)
+
+
+def frame_resource_context(
+    episode: FrameStutterEpisode,
+    sample: SystemSample,
+    findings: list[PressureFinding],
+    settings: PressureSettings,
+) -> str:
+    """Explain resource evidence around a confirmed frame stutter."""
+    lines: list[str] = []
+    background = [
+        finding for finding in findings
+        if finding.code.startswith("BACKGROUND_")
+    ]
+    foreground = [
+        finding for finding in findings
+        if finding.code.startswith("FOREGROUND_")
+    ]
+    low_ram = any(finding.code == "RAM_PRESSURE_RISK" for finding in findings)
+
+    if low_ram:
+        available_gb = sample.ram_available_mb / 1024.0
+        lines.append(
+            f"系统可用内存较低（约 {available_gb:.2f} GB），可能触发分页、资源加载或显存共享压力。"
+        )
+
+    if foreground:
+        lines.append(
+            "目标进程自身资源占用较高，本次卡顿更可能与游戏自身负载、场景变化或进程内瓶颈有关。"
+            + "；".join(finding.message for finding in foreground)
+        )
+
+    if background:
+        lines.append(
+            "卡顿期间存在后台程序资源压力，存在抢占 CPU 时间片或内存带宽的风险；"
+            "当前证据仍不能严格证明具体线程被哪个进程抢占。"
+            + "；".join(finding.message for finding in background)
+        )
+
+    target = sample.target_process
+    target_cpu = target.cpu_machine_share if target is not None else 0.0
+    target_is_light = (
+        target is not None
+        and target_cpu < settings.foreground_process_cpu_percent * 0.85
+    )
+    system_is_light = sample.cpu_percent < settings.system_cpu_percent * 0.85
+    attribution = episode.attribution
+    pipeline_is_light = (
+        attribution is not None
+        and attribution.cpu_share < 0.40
+        and attribution.gpu_share < 0.40
+    ) or (
+        attribution is None
+        and episode.peak_cpu_wait_ms > max(episode.peak_cpu_busy_ms, episode.peak_gpu_busy_ms)
+    )
+
+    if target_is_light and system_is_light and pipeline_is_light:
+        lines.append(
+            "目标进程 CPU 和整机 CPU 都未接近压力线，帧级阶段也未显示 CPU/GPU 明显吃满；"
+            "这更像等待、锁、单线程依赖、资源加载或呈现路径阻塞，而不是硬件算力不足。"
+        )
+    elif target_is_light and system_is_light and not background:
+        lines.append(
+            "整机 CPU 仍有明显余量，但目标进程也未吃满 CPU；可能是目标进程受单线程、"
+            "锁等待或资源加载限制，也可能是 GPU/呈现链路问题。"
+        )
+
+    if not lines:
+        if findings:
+            return (
+                "卡顿期间检测到系统资源压力："
+                + "；".join(finding.message for finding in findings)
+            )
+        return ""
+    return "卡顿期间资源上下文：" + "；".join(lines)
 
 
 def evaluate_pressure(
