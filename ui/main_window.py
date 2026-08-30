@@ -166,6 +166,29 @@ class StatusDot(QLabel):
         self.setText("●  正在学习基线…")
 
 
+class ClickSpinBox(QDoubleSpinBox):
+    """SpinBox that only responds to the wheel after being clicked.
+
+    Inside the settings QScrollArea, a plain QDoubleSpinBox steals wheel
+    events when the cursor merely passes over it, silently changing values
+    while the user is trying to scroll the page. This subclass forwards the
+    wheel to the parent scroll area unless the spinbox already has focus.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+        self.setAccelerated(True)
+        self.setKeyboardTracking(False)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -561,11 +584,7 @@ class MainWindow(QMainWindow):
         minimum: float,
         maximum: float,
     ) -> None:
-        spin = QDoubleSpinBox()
-        spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
-        spin.setAccelerated(True)
-        spin.setKeyboardTracking(False)
-        spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        spin = ClickSpinBox()
         spin.setDecimals(1)
         spin.setSingleStep(0.1)
         spin.setRange(minimum, maximum)
@@ -1679,9 +1698,6 @@ class MainWindow(QMainWindow):
                 padding: 4px 28px 4px 8px;
                 font-size: 12px;
             }}
-            QDoubleSpinBox:hover, QSpinBox:hover {{
-                border-color: #58a6ff;
-            }}
             QDoubleSpinBox:focus, QSpinBox:focus {{
                 border-color: #58a6ff;
                 border-width: 2px;
@@ -1691,7 +1707,8 @@ class MainWindow(QMainWindow):
                 subcontrol-origin: border;
                 subcontrol-position: top right;
                 width: 24px;
-                border-left: 1px solid #30363d;
+                height: 14px;
+                border: 1px solid #30363d;
                 border-top-right-radius: 6px;
                 background: #1c2530;
             }}
@@ -1699,33 +1716,17 @@ class MainWindow(QMainWindow):
                 subcontrol-origin: border;
                 subcontrol-position: bottom right;
                 width: 24px;
-                border-left: 1px solid #30363d;
+                height: 14px;
+                border: 1px solid #30363d;
                 border-bottom-right-radius: 6px;
                 background: #1c2530;
             }}
             QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{
                 background: #264f78;
+                border-color: #58a6ff;
             }}
             QDoubleSpinBox::up-button:pressed, QDoubleSpinBox::down-button:pressed {{
                 background: #58a6ff;
-            }}
-            QDoubleSpinBox::up-arrow {{
-                width: 8px;
-                height: 8px;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-bottom: 5px solid {TEXT};
-            }}
-            QDoubleSpinBox::down-arrow {{
-                width: 8px;
-                height: 8px;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid {TEXT};
-            }}
-            QDoubleSpinBox::up-arrow:hover, QDoubleSpinBox::down-arrow:hover {{
-                border-bottom-color: {TEXT};
-                border-top-color: {TEXT};
             }}
             QPushButton[active='true'] {{
                 background: {ACCENT};
