@@ -14,12 +14,13 @@ Layout:
 from datetime import datetime
 from collections import OrderedDict
 from time import monotonic
+from pathlib import Path
 
 import threading
 import psutil
 
-from PySide6.QtCore import Qt, QTimer, Slot, Signal
-from PySide6.QtGui import QFont, QColor, QPalette
+from PySide6.QtCore import Qt, QTimer, Slot, Signal, QPointF
+from PySide6.QtGui import QFont, QColor, QPalette, QPainter, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSplitter, QFrame, QProgressBar, QStatusBar,
@@ -187,6 +188,46 @@ class ClickSpinBox(QDoubleSpinBox):
             super().wheelEvent(event)
         else:
             event.ignore()
+
+
+def _write_spinbox_arrow(path: Path, points: tuple[QPointF, QPointF, QPointF]) -> bool:
+    """Render a HiDPI arrow used by Qt stylesheet subcontrols."""
+    pixmap = QPixmap(24, 20)
+    pixmap.setDevicePixelRatio(2.0)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(TEXT))
+    painter.drawPolygon(QPolygonF(list(points)))
+    painter.end()
+    return pixmap.save(str(path), "PNG")
+
+
+def _spinbox_arrow_stylesheet() -> str:
+    """Create arrow images for QSS; native arrows vanish once QSS owns buttons."""
+    directory = Path(__file__).resolve().parent.parent / "data"
+    directory.mkdir(parents=True, exist_ok=True)
+
+    up_path = directory / "spinbox_up.png"
+    down_path = directory / "spinbox_down.png"
+    up_written = _write_spinbox_arrow(up_path, (QPointF(1, 8), QPointF(11, 8), QPointF(6, 1)))
+    down_written = _write_spinbox_arrow(down_path, (QPointF(1, 2), QPointF(11, 2), QPointF(6, 9)))
+    if not (up_written and down_written):
+        return ""
+
+    # QSS image URLs on Windows load absolute local paths more reliably than
+    # file:/// URIs; quotes also keep paths with spaces valid CSS.
+    up_url = up_path.as_posix()
+    down_url = down_path.as_posix()
+    # Qt 6 does not reliably resolve image URLs when two ::subcontrol rules
+    # share one selector, so keep each arrow rule separate.
+    return f"""
+            QDoubleSpinBox::up-arrow {{ image: url("{up_url}"); width: 12px; height: 10px; }}
+            QSpinBox::up-arrow {{ image: url("{up_url}"); width: 12px; height: 10px; }}
+            QDoubleSpinBox::down-arrow {{ image: url("{down_url}"); width: 12px; height: 10px; }}
+            QSpinBox::down-arrow {{ image: url("{down_url}"); width: 12px; height: 10px; }}
+        """
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1703,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _apply_dark_theme(self):
+        arrow_style = _spinbox_arrow_stylesheet()
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
                 background: {BG};
@@ -1737,6 +1779,7 @@ class MainWindow(QMainWindow):
             QDoubleSpinBox::up-button:pressed, QDoubleSpinBox::down-button:pressed {{
                 background: #58a6ff;
             }}
+            {arrow_style}
             QPushButton[active='true'] {{
                 background: {ACCENT};
                 color: #0d1117;

@@ -139,7 +139,7 @@ v1 schema 仍可解析（自动按表头识别），字段映射已修正（旧�
 
 **设置保存去抖**：`QDoubleSpinBox.valueChanged` 在每格箭头/滚轮/键入时都会触发，曾经每次都同步 `write_text` 到磁盘，低 RAM 机器上连续滚动会阻塞 UI。现在 `_settings_save_timer`（500ms 单次 QTimer）在停止调整后才写盘；内存中的 settings 和 `update_sensitivity` 仍然立即生效。"恢复默认阈值"按钮绕过去抖、立即持久化。
 
-**按钮与 SpinBox 样式**：全局 `QPushButton` 增加 `:hover`（边框变蓝+背景提亮）和 `:pressed`（更亮背景+内缩 padding）状态；`QDoubleSpinBox` 显式绘制 `::up-button` / `::down-button`（24px 宽、CSS 三角箭头、hover/pressed 变色）。SpinBox 同时开启 `setAccelerated(True)`（长按加速）和 `setKeyboardTracking(False)`（键入中途不触发信号）。
+**按钮与 SpinBox 样式**：全局 `QPushButton` 增加 `:hover`（边框变蓝+背景提亮）和 `:pressed`（更亮背景+内缩 padding）状态；`QDoubleSpinBox` 显式绘制 `::up-button` / `::down-button`（24px 宽、hover/pressed 变色）。Qt 样式表接管按钮后不会自动绘制原生箭头，而 QSS 的 CSS border 三角形不可靠，因此启动时用 `QPainter` 在 `data/spinbox_up.png` / `data/spinbox_down.png` 生成 2x 透明箭头（gitignore，随缺失重建），再以带引号的绝对本地路径写入 `::up-arrow` / `::down-arrow` 的 `image`；Windows 上这种写法比 `file:///D:/...` URI 加载更可靠。SpinBox 同时开启 `setAccelerated(True)`（长按加速）和 `setKeyboardTracking(False)`（键入中途不触发信号）。
 
 ## PID 0 修复（用户指出）
 

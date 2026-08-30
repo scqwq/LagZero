@@ -19,6 +19,7 @@ env/
 # Database (user data — don't commit this)
 data/lag_history.db
 data/pressure_settings.json
+data/spinbox_*.png
 
 # PyInstaller
 dist/
