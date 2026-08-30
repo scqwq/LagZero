@@ -125,6 +125,12 @@ v1 schema 仍可解析（自动按表头识别），字段映射已修正（旧�
 
 **进程 CPU 报告口径（本轮修复）**：报告文案统一使用整机占比（`cpu_machine_share`），旧数据库无此字段时回退 `cpu_percent / machine_cpu_count()`。用户看到"整机 15.6%（约 500.0% 单核计）"而不是裸的 500%。`_rule_single_cpu_spike` 的英文 explanation 同样只用整机占比。
 
+**卡顿报告与压力警告分离**：事件列表顶部有"卡顿报告"/"压力警告"两个互斥筛选按钮，切换时清空当前行并从数据库按筛选条件重新加载。存储层 `get_recent_events` / `event_count` / `delete_all_events` 均接受 `event_type` 参数（`"stutter"` 排除 `RESOURCE_PRESSURE_RISK`，`"pressure"` 只取该类）；"清空全部"只删除当前筛选类型的事件。筛选按钮的过滤在 `EventLogWidget._matches_filter` 里做，实时新增事件如果不匹配当前筛选则不入列。
+
+**设置保存去抖**：`QDoubleSpinBox.valueChanged` 在每格箭头/滚轮/键入时都会触发，曾经每次都同步 `write_text` 到磁盘，低 RAM 机器上连续滚动会阻塞 UI。现在 `_settings_save_timer`（500ms 单次 QTimer）在停止调整后才写盘；内存中的 settings 和 `update_sensitivity` 仍然立即生效。"恢复默认阈值"按钮绕过去抖、立即持久化。
+
+**按钮与 SpinBox 样式**：全局 `QPushButton` 增加 `:hover`（边框变蓝+背景提亮）和 `:pressed`（更亮背景+内缩 padding）状态；`QDoubleSpinBox` 显式绘制 `::up-button` / `::down-button`（24px 宽、CSS 三角箭头、hover/pressed 变色）。SpinBox 同时开启 `setAccelerated(True)`（长按加速）和 `setKeyboardTracking(False)`（键入中途不触发信号）。
+
 ## PID 0 修复（用户指出）
 
 `System Idle Process`（PID 0）计的是 CPU **空转**，空闲时 psutil 报 ~100%。旧代码不过滤，空闲机器会被报告成"System Idle Process 占用 95% CPU 导致卡顿"。现在：

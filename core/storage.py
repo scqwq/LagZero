@@ -262,10 +262,20 @@ class Storage:
     # Read
     # ------------------------------------------------------------------
 
-    def get_recent_events(self, limit: int = 100, offset: int = 0) -> list[LagEvent]:
+    def get_recent_events(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: str | None = None,
+    ) -> list[LagEvent]:
         with Session(self._engine) as session:
+            stmt = select(LagEventRow)
+            if event_type == "pressure":
+                stmt = stmt.where(LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+            elif event_type == "stutter":
+                stmt = stmt.where(LagEventRow.category != "RESOURCE_PRESSURE_RISK")
             stmt = (
-                select(LagEventRow)
+                stmt
                 .order_by(LagEventRow.started_at.desc())
                 .offset(offset)
                 .limit(limit)
@@ -286,10 +296,15 @@ class Storage:
                 return None
             return self._row_to_snapshot(row)
 
-    def event_count(self) -> int:
+    def event_count(self, event_type: str | None = None) -> int:
         with Session(self._engine) as session:
             from sqlalchemy import func
-            return session.scalar(select(func.count()).select_from(LagEventRow)) or 0
+            stmt = select(func.count()).select_from(LagEventRow)
+            if event_type == "pressure":
+                stmt = stmt.where(LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+            elif event_type == "stutter":
+                stmt = stmt.where(LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+            return session.scalar(stmt) or 0
 
     # ------------------------------------------------------------------
     # Delete
@@ -306,14 +321,24 @@ class Storage:
             session.commit()
             return True
 
-    def delete_all_events(self) -> int:
+    def delete_all_events(self, event_type: str | None = None) -> int:
         with Session(self._engine) as session:
             from sqlalchemy import func
 
-            count = session.scalar(select(func.count()).select_from(LagEventRow)) or 0
+            count_stmt = select(func.count()).select_from(LagEventRow)
+            if event_type == "pressure":
+                count_stmt = count_stmt.where(LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+            elif event_type == "stutter":
+                count_stmt = count_stmt.where(LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+            count = session.scalar(count_stmt) or 0
             if count <= 0:
                 return 0
-            session.execute(delete(LagEventRow))
+            del_stmt = delete(LagEventRow)
+            if event_type == "pressure":
+                del_stmt = del_stmt.where(LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+            elif event_type == "stutter":
+                del_stmt = del_stmt.where(LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+            session.execute(del_stmt)
             session.commit()
             return int(count)
 

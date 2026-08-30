@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QApplication, QComboBox,
     QLineEdit, QPushButton, QCheckBox,
     QButtonGroup,
-    QTabWidget, QFormLayout, QDoubleSpinBox, QScrollArea,
+    QTabWidget, QFormLayout, QDoubleSpinBox, QScrollArea, QAbstractSpinBox,
 )
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import QStyle
@@ -256,6 +256,14 @@ class MainWindow(QMainWindow):
             self._hardware_cpu_count,
             self._hardware_total_ram_gb,
         )
+        # Debounced settings save: spinbox valueChanged fires on every arrow
+        # tick and keystroke, and each synchronous write_text on a low-RAM
+        # system can stall the UI thread. The in-memory settings update
+        # immediately; the disk write waits until the user stops adjusting.
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(500)
+        self._settings_save_timer.timeout.connect(self._save_pressure_settings_now)
         self._pressure_alert_scheduler = PressureAlertScheduler(RISK_ALERT_INTERVALS_S)
         self._stutter_pressure_scheduler = PressureAlertScheduler(
             STUTTER_ALERT_INTERVALS_S,
@@ -461,10 +469,18 @@ class MainWindow(QMainWindow):
                     font-weight: 700;
                 }}
                 QPushButton:hover {{ color: {TEXT}; border-color: #444c56; }}
+                QPushButton:pressed {{
+                    background: #264f78;
+                    color: {TEXT};
+                    border-color: {ACCENT};
+                }}
                 QPushButton:checked {{
                     background: {ACCENT};
                     color: {BG};
                     border-color: {ACCENT};
+                }}
+                QPushButton:checked:hover {{
+                    background: #79b8ff;
                 }}
             """)
         self._mode_button_group = QButtonGroup(self)
@@ -546,6 +562,10 @@ class MainWindow(QMainWindow):
         maximum: float,
     ) -> None:
         spin = QDoubleSpinBox()
+        spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+        spin.setAccelerated(True)
+        spin.setKeyboardTracking(False)
+        spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         spin.setDecimals(1)
         spin.setSingleStep(0.1)
         spin.setRange(minimum, maximum)
@@ -569,6 +589,7 @@ class MainWindow(QMainWindow):
         self._event_log.more_history_requested.connect(self._load_more_history)
         self._event_log.event_delete_requested.connect(self._on_event_delete_requested)
         self._event_log.clear_all_requested.connect(self._on_clear_all_events_requested)
+        self._event_log.filter_changed.connect(self._on_event_filter_changed)
         self._report_lang_combo.currentIndexChanged.connect(self._on_report_language_changed)
         self._allow_foreground_resources_checkbox.toggled.connect(self._on_foreground_policy_changed)
         self._auto_checkbox.toggled.connect(self._on_auto_toggled)
@@ -882,23 +903,26 @@ class MainWindow(QMainWindow):
             self._selected_event_ref = None
         self._event_log.remove_event(event)
         self._detail_panel.clear_event()
-        count = self._storage.event_count()
-        self._event_count_label.setText(f"已记录 {count} 个事件")
-        self._set_status_message("已删除 1 条卡顿报告", force=True)
+        event_type = self._event_log.filter_mode
+        count = self._storage.event_count(event_type)
+        label = "压力警告" if event_type == "pressure" else "卡顿报告"
+        self._event_count_label.setText(f"{label}：{count} 条")
+        self._set_status_message(f"已删除 1 条{label}", force=True)
 
-    @Slot()
-    def _on_clear_all_events_requested(self):
-        removed = self._storage.delete_all_events()
+    @Slot(str)
+    def _on_clear_all_events_requested(self, filter_mode: str = "stutter"):
+        removed = self._storage.delete_all_events(filter_mode)
+        label = "压力警告" if filter_mode == "pressure" else "卡顿报告"
         if removed <= 0:
-            self._set_status_message("当前没有可清空的卡顿报告", force=True)
+            self._set_status_message(f"当前没有可清空的{label}", force=True)
             return
         self._snapshot_cache.clear()
         self._selected_event_id = None
         self._selected_event_ref = None
         self._event_log.clear_events()
         self._detail_panel.clear_event()
-        self._event_count_label.setText("已记录 0 个事件")
-        self._set_status_message(f"已清空 {removed} 条卡顿报告", force=True)
+        self._event_count_label.setText(f"{label}：0 条")
+        self._set_status_message(f"已清空 {removed} 条{label}", force=True)
 
     @Slot(int)
     def _on_report_language_changed(self, _index: int):
@@ -910,12 +934,11 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_foreground_policy_changed(self, enabled: bool):
         self._pressure_settings.allow_foreground_high_usage = enabled
-        save_settings(self._pressure_settings)
+        self._settings_save_timer.start()
 
     @Slot(str, float)
     def _on_pressure_threshold_changed(self, field: str, value: float):
         setattr(self._pressure_settings, field, value)
-        save_settings(self._pressure_settings)
         if field in {"frame_spike_ratio", "frame_stutter_ratio"}:
             detector = getattr(self, "_frame_detector", None)
             if detector is not None:
@@ -923,6 +946,10 @@ class MainWindow(QMainWindow):
                     self._pressure_settings.frame_spike_ratio,
                     self._pressure_settings.frame_stutter_ratio,
                 )
+
+    @Slot()
+    def _save_pressure_settings_now(self):
+        save_settings(self._pressure_settings)
 
     @Slot()
     def _reset_pressure_settings(self):
@@ -942,8 +969,10 @@ class MainWindow(QMainWindow):
             detector.update_sensitivity(
                 self._pressure_settings.frame_spike_ratio,
                 self._pressure_settings.frame_stutter_ratio,
-            )
-        save_settings(self._pressure_settings)
+                )
+        # A deliberate reset should persist immediately, not on a debounce.
+        self._settings_save_timer.stop()
+        self._save_pressure_settings_now()
         self._set_status_message("已恢复默认压力阈值", force=True)
 
     @Slot(bool)
@@ -1451,8 +1480,10 @@ class MainWindow(QMainWindow):
             self._detail_panel.show_event(event, snapshot)
 
     def _refresh_event_count_async(self):
+        event_type = self._event_log.filter_mode
+
         def _worker():
-            count = self._storage.event_count()
+            count = self._storage.event_count(event_type)
             self.event_count_loaded.emit(count)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -1460,7 +1491,8 @@ class MainWindow(QMainWindow):
     @Slot(int)
     def _on_event_count_loaded(self, count: int):
         self._event_log.set_total_count(count)
-        self._event_count_label.setText(f"已记录 {count} 个事件")
+        label = "压力警告" if self._event_log.filter_mode == "pressure" else "卡顿报告"
+        self._event_count_label.setText(f"{label}：{count} 条")
 
     @Slot(str)
     def _on_capture_error(self, message: str):
@@ -1479,10 +1511,13 @@ class MainWindow(QMainWindow):
         self._history_offset = 0
         self._history_loading = False
         self._event_log.clear_events()
+        event_type = self._event_log.filter_mode
 
         def _worker():
-            count = self._storage.event_count()
-            events = self._storage.get_recent_events(limit=HISTORY_PAGE_SIZE)
+            count = self._storage.event_count(event_type)
+            events = self._storage.get_recent_events(
+                limit=HISTORY_PAGE_SIZE, event_type=event_type
+            )
             self.history_loaded.emit(events)
             self.event_count_loaded.emit(count)
 
@@ -1497,12 +1532,23 @@ class MainWindow(QMainWindow):
         if self._history_loading:
             return
         self._history_loading = True
+        event_type = self._event_log.filter_mode
 
         def _worker():
             events = self._storage.get_recent_events(
-                limit=HISTORY_PAGE_SIZE, offset=self._history_offset
+                limit=HISTORY_PAGE_SIZE, offset=self._history_offset,
+                event_type=event_type,
             )
             self.history_loaded.emit(events)
+
+    @Slot(str)
+    def _on_event_filter_changed(self, mode: str):
+        self._history_offset = 0
+        self._history_loading = False
+        self._selected_event_id = None
+        self._selected_event_ref = None
+        self._detail_panel.clear_event()
+        self._load_history()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1609,6 +1655,77 @@ class MainWindow(QMainWindow):
                 border: 1px solid #30363d;
                 border-radius: 6px;
                 padding: 6px 8px;
+            }}
+            QPushButton:hover {{
+                background: #1c2530;
+                border-color: #58a6ff;
+            }}
+            QPushButton:pressed {{
+                background: #264f78;
+                border-color: #58a6ff;
+                padding-top: 7px;
+                padding-left: 9px;
+            }}
+            QPushButton:disabled {{
+                color: #484f58;
+                background: #0d1117;
+                border-color: #21262d;
+            }}
+            QDoubleSpinBox, QSpinBox {{
+                background: #11161d;
+                color: {TEXT};
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 4px 28px 4px 8px;
+                font-size: 12px;
+            }}
+            QDoubleSpinBox:hover, QSpinBox:hover {{
+                border-color: #58a6ff;
+            }}
+            QDoubleSpinBox:focus, QSpinBox:focus {{
+                border-color: #58a6ff;
+                border-width: 2px;
+                padding: 3px 27px 3px 7px;
+            }}
+            QDoubleSpinBox::up-button {{
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 24px;
+                border-left: 1px solid #30363d;
+                border-top-right-radius: 6px;
+                background: #1c2530;
+            }}
+            QDoubleSpinBox::down-button {{
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 24px;
+                border-left: 1px solid #30363d;
+                border-bottom-right-radius: 6px;
+                background: #1c2530;
+            }}
+            QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{
+                background: #264f78;
+            }}
+            QDoubleSpinBox::up-button:pressed, QDoubleSpinBox::down-button:pressed {{
+                background: #58a6ff;
+            }}
+            QDoubleSpinBox::up-arrow {{
+                width: 8px;
+                height: 8px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 5px solid {TEXT};
+            }}
+            QDoubleSpinBox::down-arrow {{
+                width: 8px;
+                height: 8px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {TEXT};
+            }}
+            QDoubleSpinBox::up-arrow:hover, QDoubleSpinBox::down-arrow:hover {{
+                border-bottom-color: {TEXT};
+                border-top-color: {TEXT};
             }}
             QPushButton[active='true'] {{
                 background: {ACCENT};

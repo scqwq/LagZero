@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QScrollArea,
     QFrame, QHBoxLayout, QPushButton,
+    QButtonGroup,
 )
 
 from core.models import LagEvent
@@ -191,8 +192,9 @@ class EventLogWidget(QWidget):
 
     event_selected = Signal(object)   # LagEvent
     event_delete_requested = Signal(object)  # LagEvent
-    clear_all_requested = Signal()
+    clear_all_requested = Signal(str)  # "stutter" or "pressure"
     more_history_requested = Signal()
+    filter_changed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -200,6 +202,7 @@ class EventLogWidget(QWidget):
         self._selected_row: EventRow | None = None
         self._total_count = 0
         self._loading_more = False
+        self._filter_mode = "stutter"
         self._build()
 
     def _build(self):
@@ -211,6 +214,46 @@ class EventLogWidget(QWidget):
         header = QHBoxLayout()
         title = QLabel("卡顿事件")
         title.setStyleSheet(f"color: {MUTED}; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
+
+        filter_style = f"""
+            QPushButton {{
+                color: {MUTED};
+                background: transparent;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                color: {TEXT};
+                border-color: #58a6ff;
+                background: {BG3};
+            }}
+            QPushButton:pressed {{
+                background: #264f78;
+                border-color: #58a6ff;
+            }}
+            QPushButton:checked {{
+                color: {BG};
+                background: {ACCENT};
+                border-color: {ACCENT};
+            }}
+        """
+        self._filter_group = QButtonGroup(self)
+        self._filter_group.setExclusive(True)
+        self._stutter_filter_btn = QPushButton("卡顿报告")
+        self._stutter_filter_btn.setCheckable(True)
+        self._stutter_filter_btn.setChecked(True)
+        self._stutter_filter_btn.setStyleSheet(filter_style)
+        self._pressure_filter_btn = QPushButton("压力警告")
+        self._pressure_filter_btn.setCheckable(True)
+        self._pressure_filter_btn.setStyleSheet(filter_style)
+        self._filter_group.addButton(self._stutter_filter_btn)
+        self._filter_group.addButton(self._pressure_filter_btn)
+        self._stutter_filter_btn.clicked.connect(lambda: self._on_filter_changed("stutter"))
+        self._pressure_filter_btn.clicked.connect(lambda: self._on_filter_changed("pressure"))
+
         self._count_label = QLabel("0")
         self._count_label.setStyleSheet(f"""
             color: {BG};
@@ -237,9 +280,17 @@ class EventLogWidget(QWidget):
                 border-color: #58a6ff;
                 background: {BG3};
             }}
+            QPushButton:pressed {{
+                background: #264f78;
+                border-color: #58a6ff;
+            }}
         """)
-        self._clear_all_btn.clicked.connect(self.clear_all_requested.emit)
+        self._clear_all_btn.clicked.connect(
+            lambda: self.clear_all_requested.emit(self._filter_mode)
+        )
         header.addWidget(title)
+        header.addWidget(self._stutter_filter_btn)
+        header.addWidget(self._pressure_filter_btn)
         header.addWidget(self._count_label)
         header.addStretch()
         header.addWidget(self._clear_all_btn)
@@ -271,6 +322,8 @@ class EventLogWidget(QWidget):
 
     def add_event(self, event: LagEvent):
         """Prepend a new event row at the top of the list."""
+        if not self._matches_filter(event):
+            return
         if self._empty_label.isVisible():
             self._empty_label.hide()
 
@@ -286,6 +339,8 @@ class EventLogWidget(QWidget):
         """Append one older history page, keeping newest rows at the top."""
         self._loading_more = False
         for event in events:
+            if not self._matches_filter(event):
+                continue
             self._rows.append(EventRow(event))
             row = self._rows[-1]
             row.clicked.connect(self._on_row_clicked)
@@ -328,6 +383,26 @@ class EventLogWidget(QWidget):
         self._selected_row = None
         self._refresh_state()
 
+    def set_filter_mode(self, mode: str):
+        if mode not in {"stutter", "pressure"} or mode == self._filter_mode:
+            return
+        self._filter_mode = mode
+        self._stutter_filter_btn.setChecked(mode == "stutter")
+        self._pressure_filter_btn.setChecked(mode == "pressure")
+        self.clear_events()
+        self.filter_changed.emit(mode)
+
+    @property
+    def filter_mode(self) -> str:
+        return self._filter_mode
+
+    def _matches_filter(self, event: LagEvent) -> bool:
+        is_pressure = event.category == "RESOURCE_PRESSURE_RISK"
+        return is_pressure if self._filter_mode == "pressure" else not is_pressure
+
+    def _on_filter_changed(self, mode: str):
+        self.set_filter_mode(mode)
+
     def _on_row_clicked(self, event: LagEvent):
         # Deselect previous
         if self._selected_row:
@@ -342,7 +417,12 @@ class EventLogWidget(QWidget):
 
     def _refresh_state(self):
         self._count_label.setText(str(self._total_count))
-        self._empty_label.setVisible(self._total_count == 0)
+        has_rows = self._total_count > 0
+        self._empty_label.setVisible(not has_rows)
+        if self._filter_mode == "pressure":
+            self._empty_label.setText("暂时没有压力警告。\n系统资源压力较高时会在此提示。")
+        else:
+            self._empty_label.setText("暂时还没有卡顿事件。\n正在持续监控你的系统…")
         self._clear_all_btn.setEnabled(self._total_count > 0)
 
     def _maybe_request_more_history(self):
