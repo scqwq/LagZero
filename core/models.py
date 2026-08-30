@@ -97,6 +97,11 @@ class LagEvent:
     # so without this the report loses "what the player saw" as soon as the cause
     # analyzer supplies "why it happened".
     frame_summary: str = ""
+    # Which detector produced this event: "frame" (PresentMon), "compat"
+    # (window/response with clear stutter evidence), "compat_pressure"
+    # (compat CPU/IO pressure with mild response), "system" (system-level
+    # composite), or "pressure" (resource threshold evaluation).
+    detection_source: str = ""
 
 
 @dataclass

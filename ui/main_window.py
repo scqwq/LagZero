@@ -714,6 +714,7 @@ class MainWindow(QMainWindow):
             scope="LOCAL",
             duration_seconds=0.0,
             is_pending=False,
+            detection_source="pressure",
         )
         snapshot = LagSnapshot(
             id=None,
@@ -1407,6 +1408,7 @@ class MainWindow(QMainWindow):
             category="REPORT_PENDING",
             scope="UNDETERMINED",
             is_pending=True,
+            detection_source="compat" if self._compat_active else "frame",
         )
         self._stutter_pressure_scheduler.reset()
         self._event_log.upsert_event(self._pending_frame_event)
@@ -1457,6 +1459,13 @@ class MainWindow(QMainWindow):
         event.cause_code = verdict.category
         event.scope = verdict.scope
         event.frame_summary = verdict.frame_summary
+        if episode.present_mode == "compatibility":
+            if episode.event_type in ("COMPAT_CPU_PRESSURE", "COMPAT_IO_PRESSURE"):
+                event.detection_source = "compat_pressure"
+            else:
+                event.detection_source = "compat"
+        else:
+            event.detection_source = "frame"
 
         # Persist off the UI thread: SQLAlchemy session setup + commit on a
         # database that also serves background reads used to freeze the whole

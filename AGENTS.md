@@ -125,7 +125,17 @@ v1 schema 仍可解析（自动按表头识别），字段映射已修正（旧�
 
 **进程 CPU 报告口径（本轮修复）**：报告文案统一使用整机占比（`cpu_machine_share`），旧数据库无此字段时回退 `cpu_percent / machine_cpu_count()`。用户看到"整机 15.6%（约 500.0% 单核计）"而不是裸的 500%。`_rule_single_cpu_spike` 的英文 explanation 同样只用整机占比。
 
-**卡顿报告与压力警告分离**：事件列表顶部有"卡顿报告"/"压力警告"两个互斥筛选按钮，切换时清空当前行并从数据库按筛选条件重新加载。存储层 `get_recent_events` / `event_count` / `delete_all_events` 均接受 `event_type` 参数（`"stutter"` 排除 `RESOURCE_PRESSURE_RISK`，`"pressure"` 只取该类）；"清空全部"只删除当前筛选类型的事件。筛选按钮的过滤在 `EventLogWidget._matches_filter` 里做，实时新增事件如果不匹配当前筛选则不入列。
+**卡顿报告与压力警告分离（`detection_source` 字段）**：事件列表顶部有"卡顿报告"/"压力警告"两个互斥筛选按钮，切换时清空当前行并从数据库按筛选条件重新加载。每个 `LagEvent` 携带 `detection_source` 字段标记来源：
+
+| detection_source | 含义 | 归属标签页 |
+|---|---|---|
+| `frame` | PresentMon 帧级检测（帧时间/掉帧/上屏异常） | 卡顿报告 |
+| `compat` | 兼容模式检测，有明确卡顿证据（窗口挂起/视觉冻结/响应尖峰） | 卡顿报告 |
+| `compat_pressure` | 兼容模式检测，仅资源压力+中等响应延迟（CPU/IO ≥60ms） | 压力警告 |
+| `system` | 系统级复合评分（当前已禁用；若启用自动归压力） | 压力警告 |
+| `pressure` | 压力评估（无卡顿时的资源阈值超标） | 压力警告 |
+
+存储层 `get_recent_events` / `event_count` / `delete_all_events` 按 `detection_source` 过滤：`"stutter"` 取 `frame+compat`，`"pressure"` 取 `pressure+system+compat_pressure`。旧数据库迁移时按 `category` 回填 `detection_source`（`RESOURCE_PRESSURE_RISK` → pressure，`CPU Pressure Stall` / `I/O Pressure Stall` → compat_pressure，其余 → frame）。`EventLogWidget._matches_filter` 做同样的分类；`upsert_event` 在事件分析完成后如果 `detection_source` 变化（如 compat → compat_pressure），会自动将事件从当前标签页移除。"清空全部"只删除当前筛选类型的事件。
 
 **设置保存去抖**：`QDoubleSpinBox.valueChanged` 在每格箭头/滚轮/键入时都会触发，曾经每次都同步 `write_text` 到磁盘，低 RAM 机器上连续滚动会阻塞 UI。现在 `_settings_save_timer`（500ms 单次 QTimer）在停止调整后才写盘；内存中的 settings 和 `update_sensitivity` 仍然立即生效。"恢复默认阈值"按钮绕过去抖、立即持久化。
 

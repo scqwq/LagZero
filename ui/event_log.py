@@ -355,6 +355,11 @@ class EventLogWidget(QWidget):
     def upsert_event(self, event: LagEvent):
         for row in self._rows:
             if row._lag_event is event or (event.id and row._lag_event.id == event.id):
+                if not self._matches_filter(event):
+                    # The analysis finalised this event into a different tab
+                    # (e.g. compat CPU pressure was reclassified as pressure).
+                    self.remove_event(event)
+                    return
                 row._lag_event = event
                 row.refresh()
                 return
@@ -397,8 +402,17 @@ class EventLogWidget(QWidget):
         return self._filter_mode
 
     def _matches_filter(self, event: LagEvent) -> bool:
-        is_pressure = event.category == "RESOURCE_PRESSURE_RISK"
-        return is_pressure if self._filter_mode == "pressure" else not is_pressure
+        source = event.detection_source
+        if not source:
+            # Legacy events saved before detection_source existed; infer from
+            # the category so old records still land in the correct tab.
+            if event.category in ("RESOURCE_PRESSURE_RISK", "CPU Pressure Stall", "I/O Pressure Stall"):
+                source = "pressure"
+            else:
+                source = "frame"
+        if self._filter_mode == "pressure":
+            return source in ("pressure", "system", "compat_pressure")
+        return source in ("frame", "compat")
 
     def _on_filter_changed(self, mode: str):
         self.set_filter_mode(mode)

@@ -85,6 +85,7 @@ class LagEventRow(Base):
     # `cause` so a reloaded report can still show what the player saw, not just
     # the system-side root cause.
     frame_summary = Column(Text, default="")
+    detection_source = Column(String(32), default="")
 
     snapshots = relationship("LagSnapshotRow", back_populates="event", cascade="all, delete-orphan")
 
@@ -131,6 +132,23 @@ class Storage:
                 conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN scope VARCHAR(64) DEFAULT ''")
             if "frame_summary" not in existing:
                 conn.exec_driver_sql("ALTER TABLE lag_events ADD COLUMN frame_summary TEXT DEFAULT ''")
+            if "detection_source" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE lag_events ADD COLUMN detection_source VARCHAR(32) DEFAULT ''"
+                )
+                # Backfill legacy rows so the tab filter works immediately.
+                conn.exec_driver_sql(
+                    "UPDATE lag_events SET detection_source = 'pressure' "
+                    "WHERE category = 'RESOURCE_PRESSURE_RISK'"
+                )
+                conn.exec_driver_sql(
+                    "UPDATE lag_events SET detection_source = 'compat_pressure' "
+                    "WHERE category IN ('CPU Pressure Stall', 'I/O Pressure Stall')"
+                )
+                conn.exec_driver_sql(
+                    "UPDATE lag_events SET detection_source = 'frame' "
+                    "WHERE detection_source = ''"
+                )
             snapshot_existing = {
                 row[1]
                 for row in conn.exec_driver_sql("PRAGMA table_info(lag_snapshots)").fetchall()
@@ -167,6 +185,7 @@ class Storage:
             row.scope = event.scope
             row.duration_seconds = event.duration_seconds
             row.frame_summary = event.frame_summary
+            row.detection_source = event.detection_source
 
             session.commit()
             session.refresh(row)
@@ -271,9 +290,15 @@ class Storage:
         with Session(self._engine) as session:
             stmt = select(LagEventRow)
             if event_type == "pressure":
-                stmt = stmt.where(LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+                stmt = stmt.where(
+                    LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
+                    | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+                )
             elif event_type == "stutter":
-                stmt = stmt.where(LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+                stmt = stmt.where(
+                    LagEventRow.detection_source.in_(("frame", "compat"))
+                    & (LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+                )
             stmt = (
                 stmt
                 .order_by(LagEventRow.started_at.desc())
@@ -301,9 +326,15 @@ class Storage:
             from sqlalchemy import func
             stmt = select(func.count()).select_from(LagEventRow)
             if event_type == "pressure":
-                stmt = stmt.where(LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+                stmt = stmt.where(
+                    LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
+                    | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+                )
             elif event_type == "stutter":
-                stmt = stmt.where(LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+                stmt = stmt.where(
+                    LagEventRow.detection_source.in_(("frame", "compat"))
+                    & (LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+                )
             return session.scalar(stmt) or 0
 
     # ------------------------------------------------------------------
@@ -327,17 +358,29 @@ class Storage:
 
             count_stmt = select(func.count()).select_from(LagEventRow)
             if event_type == "pressure":
-                count_stmt = count_stmt.where(LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+                count_stmt = count_stmt.where(
+                    LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
+                    | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+                )
             elif event_type == "stutter":
-                count_stmt = count_stmt.where(LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+                count_stmt = count_stmt.where(
+                    LagEventRow.detection_source.in_(("frame", "compat"))
+                    & (LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+                )
             count = session.scalar(count_stmt) or 0
             if count <= 0:
                 return 0
             del_stmt = delete(LagEventRow)
             if event_type == "pressure":
-                del_stmt = del_stmt.where(LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+                del_stmt = del_stmt.where(
+                    LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
+                    | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+                )
             elif event_type == "stutter":
-                del_stmt = del_stmt.where(LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+                del_stmt = del_stmt.where(
+                    LagEventRow.detection_source.in_(("frame", "compat"))
+                    & (LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+                )
             session.execute(del_stmt)
             session.commit()
             return int(count)
@@ -359,6 +402,7 @@ class Storage:
             scope=row.scope or "",
             duration_seconds=row.duration_seconds,
             frame_summary=row.frame_summary or "",
+            detection_source=row.detection_source or "",
         )
 
     @staticmethod
