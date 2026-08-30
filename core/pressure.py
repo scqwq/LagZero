@@ -50,6 +50,12 @@ class PressureEvaluation:
     near_active: bool
 
 
+@dataclass
+class BackoffState:
+    level: int = 0
+    last_emit_at: float | None = None
+
+
 PRESSURE_FINDING_GROUPS = {
     "系统压力": {"CPU_PRESSURE_RISK", "RAM_PRESSURE_RISK"},
     "前台进程压力": {
@@ -119,6 +125,40 @@ class PressureAlertScheduler:
         self.active_since = None
         self.last_alert_at = None
         self.recovery_since = None
+
+
+class ExponentialBackoffGate:
+    """Per-key exponential cooldown for discrete report generation."""
+
+    def __init__(self, intervals: list[float], reset_after_factor: float = 2.0):
+        self.intervals = list(intervals)
+        self.reset_after_factor = max(1.0, float(reset_after_factor))
+        self._states: dict[str, BackoffState] = {}
+
+    def allow(self, key: str, now: float | None = None) -> bool:
+        current = monotonic() if now is None else now
+        state = self._states.get(key)
+        if state is None or state.last_emit_at is None:
+            self._states[key] = BackoffState(level=0, last_emit_at=current)
+            return True
+
+        interval = self.intervals[min(state.level, len(self.intervals) - 1)]
+        elapsed = current - state.last_emit_at
+        if elapsed < interval:
+            return False
+
+        if elapsed >= interval * self.reset_after_factor:
+            state.level = 0
+        else:
+            state.level = min(state.level + 1, len(self.intervals) - 1)
+        state.last_emit_at = current
+        return True
+
+    def reset(self, key: str | None = None) -> None:
+        if key is None:
+            self._states.clear()
+            return
+        self._states.pop(key, None)
 
 # 剩余总RAM 警告
 def ram_available_warning_gb(total_ram_gb: float) -> float:

@@ -40,6 +40,7 @@ from ui.event_log import EventLogWidget
 from ui.detail_panel import DetailPanelWidget
 from core.collectors import machine_cpu_count
 from core.pressure import (
+    ExponentialBackoffGate,
     PressureAlertScheduler,
     default_settings,
     evaluate_pressure,
@@ -74,6 +75,20 @@ RISK_ALERT_INTERVALS_S = [15.0, 30.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1800.0]
 STUTTER_ALERT_INTERVALS_S = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 MANUAL_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 AUTO_HIGH_PRECISION_RECOVERY_DURATION_S = 0
+STUTTER_REPORT_SOURCES = {"frame", "compat"}
+PRESSURE_REPORT_SOURCES = {"pressure", "system", "compat_pressure"}
+PRESSURE_ONLY_CATEGORIES = {
+    "RESOURCE_PRESSURE_RISK",
+    "VRAM_PRESSURE",
+    "SYSTEM_RAM_PRESSURE",
+    "RAM_PRESSURE",
+    "RAM_EXHAUSTION",
+    "GAME_MEMORY_LIMIT",
+    "BACKGROUND_INTERFERENCE",
+    "BACKGROUND_CLUSTER",
+    "IO_STALL",
+    "DISK_IO",
+}
 
 EVENT_LABELS = {
     "COMPAT_WINDOW_HANG": "Window Not Responding",
@@ -333,6 +348,8 @@ class MainWindow(QMainWindow):
             STUTTER_ALERT_INTERVALS_S,
             onset_seconds=0.0,
         )
+        self._pressure_report_gate = ExponentialBackoffGate(RISK_ALERT_INTERVALS_S)
+        self._stutter_report_gate = ExponentialBackoffGate(STUTTER_ALERT_INTERVALS_S)
         self._last_pressure_findings = []
 
         self.setWindowTitle("LagLense")
@@ -769,20 +786,116 @@ class MainWindow(QMainWindow):
             peak_responsiveness_ms=sample.responsiveness_ms,
             process_groups=sample.process_groups,
         )
+        self._emit_report_event(
+            event,
+            snapshot,
+            cooldown_key=self._cooldown_key_for_event(event, findings=findings),
+            status_message="系统压力：当前尚未检测到明显帧卡顿，但系统资源占用较高。",
+            tray_title="系统压力",
+            tray_message="尚未检测到明显帧卡顿，但系统资源占用较高，可能影响游戏流畅性。",
+            suppressed_message="已压缩短时间内重复的系统压力报告。",
+        )
+
+    @staticmethod
+    def _pressure_family_from_codes(codes: list[str]) -> str:
+        normalized = {str(code or "").strip() for code in codes if str(code or "").strip()}
+        if normalized & {"RAM_PRESSURE_RISK", "SYSTEM_RAM_PRESSURE", "RAM_PRESSURE", "RAM_EXHAUSTION", "GAME_MEMORY_LIMIT"}:
+            return "memory"
+        if normalized & {"VRAM_PRESSURE"}:
+            return "vram"
+        if normalized & {"IO_STALL", "DISK_IO", "COMPAT_IO_PRESSURE", "I/O Pressure Stall"}:
+            return "io"
+        if normalized & {
+            "CPU_PRESSURE_RISK",
+            "CPU_BOUND",
+            "CPU_STAGE_STALL",
+            "BACKGROUND_INTERFERENCE",
+            "BACKGROUND_CLUSTER",
+            "COMPAT_CPU_PRESSURE",
+            "CPU Pressure Stall",
+            "SCHEDULER_CONTENTION",
+        }:
+            return "cpu"
+        return "resource"
+
+    @staticmethod
+    def _is_pressure_only_category(category: str) -> bool:
+        return (category or "").strip() in PRESSURE_ONLY_CATEGORIES
+
+    def _resolve_detection_source(
+        self,
+        category: str,
+        *,
+        episode: FrameStutterEpisode | None = None,
+        fallback_source: str = "pressure",
+    ) -> str:
+        normalized = (category or "").strip()
+        if episode is None:
+            return fallback_source
+        if episode.present_mode == "compatibility":
+            if episode.event_type in ("COMPAT_CPU_PRESSURE", "COMPAT_IO_PRESSURE"):
+                return "compat_pressure"
+            if self._is_pressure_only_category(normalized):
+                return "pressure"
+            return "compat"
+        if self._is_pressure_only_category(normalized):
+            return "pressure"
+        return "frame"
+
+    def _report_gate_for_source(self, source: str) -> ExponentialBackoffGate:
+        if source in STUTTER_REPORT_SOURCES:
+            return self._stutter_report_gate
+        return self._pressure_report_gate
+
+    def _cooldown_key_for_event(self, event: LagEvent, *, findings: list | None = None) -> str:
+        source = event.detection_source or "pressure"
+        category = event.category or event.cause_code or "UNKNOWN"
+        if source in STUTTER_REPORT_SOURCES:
+            return f"stutter:{category}"
+        if findings:
+            family = self._pressure_family_from_codes([getattr(finding, "code", "") for finding in findings])
+            return f"pressure:{family}"
+        family = self._pressure_family_from_codes([category])
+        return f"pressure:{family}"
+
+    def _emit_report_event(
+        self,
+        event: LagEvent,
+        snapshot: LagSnapshot | None,
+        *,
+        cooldown_key: str,
+        status_message: str,
+        tray_title: str,
+        tray_message: str,
+        suppressed_message: str,
+    ) -> bool:
+        gate = self._report_gate_for_source(event.detection_source)
+        if not gate.allow(cooldown_key):
+            self._event_log.remove_event(event)
+            if self._selected_event_ref is event:
+                self._selected_event_ref = None
+                self._selected_event_id = None
+                self._detail_panel.clear_event()
+            self._set_status_message(suppressed_message, force=True)
+            return False
+
+        visible_in_current_filter = self._event_log._matches_filter(event)
         self._persist_event_async(event, snapshot)
         self._event_log.upsert_event(event)
+        if not visible_in_current_filter and self._selected_event_ref is event:
+            self._selected_event_ref = None
+            self._selected_event_id = None
+            self._detail_panel.clear_event()
         self._refresh_event_count_async()
-        self._set_status_message(
-            "资源压力风险：当前尚未检测到明显帧卡顿，但系统资源占用较高。",
-            force=True,
-        )
-        if self._tray and self._tray.isVisible():
+        self._set_status_message(status_message, force=True)
+        if self._tray and self._tray.isVisible() and self._should_notify_tray(event):
             self._tray.showMessage(
-                "资源压力风险",
-                "尚未检测到明显帧卡顿，但系统资源占用较高，可能影响游戏流畅性。",
+                tray_title,
+                tray_message,
                 QSystemTrayIcon.MessageIcon.Warning,
                 4000,
             )
+        return True
 
     @Slot(object)
     def _on_score(self, score: LagScore):
@@ -855,26 +968,21 @@ class MainWindow(QMainWindow):
         event.category = category
         event.scope = scope
         event.is_pending = False
-
-        # Persist off the UI thread (same reasoning as _on_frame_stutter_ended).
-        self._persist_event_async(event, snapshot)
-
-        # Update UI
-        self._event_log.upsert_event(event)
-        self._refresh_event_count_async()
-        self._set_status_message(
-            f"✓  卡顿结束 — {round(event.duration_seconds, 1)} 秒 — {category}"
-            , force=True
+        event.detection_source = self._resolve_detection_source(
+            category,
+            episode=None,
+            fallback_source="system",
         )
-
-        # Tray notification (throttled per category — see _should_notify_tray)
-        if self._tray and self._tray.isVisible() and self._should_notify_tray(event):
-            self._tray.showMessage(
-                "检测到卡顿事件",
-                f"{category}: {cause[:80]}…" if len(cause) > 80 else cause,
-                QSystemTrayIcon.MessageIcon.Warning,
-                4000,
-            )
+        bucket = "系统压力" if event.detection_source in PRESSURE_REPORT_SOURCES else "卡顿报告"
+        self._emit_report_event(
+            event,
+            snapshot,
+            cooldown_key=self._cooldown_key_for_event(event),
+            status_message=f"{bucket}：{category}，持续 {round(event.duration_seconds, 1)} 秒。",
+            tray_title=bucket,
+            tray_message=f"{category}: {cause[:120]}",
+            suppressed_message=f"已压缩短时间内重复的{bucket}。",
+        )
 
         self._active_event = None
 
@@ -955,7 +1063,7 @@ class MainWindow(QMainWindow):
             self._pending_frame_event = None
         deleted = self._storage.delete_event(event.id)
         if event.id and not deleted:
-            self._set_status_message("删除卡顿报告失败：记录不存在或已被删除", force=True)
+            self._set_status_message("删除报告失败：记录不存在或已被删除", force=True)
             return
         if event.id:
             self._snapshot_cache.pop(event.id, None)
@@ -966,14 +1074,14 @@ class MainWindow(QMainWindow):
         self._detail_panel.clear_event()
         event_type = self._event_log.filter_mode
         count = self._storage.event_count(event_type)
-        label = "压力警告" if event_type == "pressure" else "卡顿报告"
+        label = "系统压力" if event_type == "pressure" else "卡顿报告"
         self._event_count_label.setText(f"{label}：{count} 条")
         self._set_status_message(f"已删除 1 条{label}", force=True)
 
     @Slot(str)
     def _on_clear_all_events_requested(self, filter_mode: str = "stutter"):
         removed = self._storage.delete_all_events(filter_mode)
-        label = "压力警告" if filter_mode == "pressure" else "卡顿报告"
+        label = "系统压力" if filter_mode == "pressure" else "卡顿报告"
         if removed <= 0:
             self._set_status_message(f"当前没有可清空的{label}", force=True)
             return
@@ -1500,27 +1608,28 @@ class MainWindow(QMainWindow):
         event.cause_code = verdict.category
         event.scope = verdict.scope
         event.frame_summary = verdict.frame_summary
-        if episode.present_mode == "compatibility":
-            if episode.event_type in ("COMPAT_CPU_PRESSURE", "COMPAT_IO_PRESSURE"):
-                event.detection_source = "compat_pressure"
-            else:
-                event.detection_source = "compat"
-        else:
-            event.detection_source = "frame"
-
-        # Persist off the UI thread: SQLAlchemy session setup + commit on a
-        # database that also serves background reads used to freeze the whole
-        # window for the duration of the write, right when the user was trying
-        # to switch reports. Everything the DB needs is already in plain
-        # objects, so the worker is pure I/O.
-        self._persist_event_async(event, snapshot)
-
-        # The log row and (if selected) the report show the finalised data
-        # immediately; the id is filled in when the write lands.
-        self._event_log.upsert_event(event)
-        self._refresh_event_count_async()
-        self.statusBar().showMessage(
-            f"已记录 {event.category} — 峰值 {episode.peak_frame_time_ms:.1f} ms"
+        event.detection_source = self._resolve_detection_source(
+            verdict.category,
+            episode=episode,
+            fallback_source="frame",
+        )
+        bucket = "系统压力" if event.detection_source in PRESSURE_REPORT_SOURCES else "卡顿报告"
+        timing_label = "峰值响应" if episode.present_mode == "compatibility" else "峰值帧时间"
+        self._emit_report_event(
+            event,
+            snapshot,
+            cooldown_key=self._cooldown_key_for_event(event),
+            status_message=(
+                f"{bucket}：{event.category}，{timing_label} "
+                f"{episode.peak_frame_time_ms:.1f} ms。"
+            ),
+            tray_title=bucket,
+            tray_message=(
+                f"{event.category}: {event.cause[:120]}"
+                if len(event.cause) > 120
+                else f"{event.category}: {event.cause}"
+            ),
+            suppressed_message=f"已压缩短时间内重复的{bucket}。",
         )
         self._pending_frame_event = None
         self._last_pressure_findings = []
@@ -1560,7 +1669,7 @@ class MainWindow(QMainWindow):
     @Slot(int)
     def _on_event_count_loaded(self, count: int):
         self._event_log.set_total_count(count)
-        label = "压力警告" if self._event_log.filter_mode == "pressure" else "卡顿报告"
+        label = "系统压力" if self._event_log.filter_mode == "pressure" else "卡顿报告"
         self._event_count_label.setText(f"{label}：{count} 条")
 
     @Slot(str)

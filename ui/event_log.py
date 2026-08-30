@@ -246,7 +246,7 @@ class EventLogWidget(QWidget):
         self._stutter_filter_btn.setCheckable(True)
         self._stutter_filter_btn.setChecked(True)
         self._stutter_filter_btn.setStyleSheet(filter_style)
-        self._pressure_filter_btn = QPushButton("压力警告")
+        self._pressure_filter_btn = QPushButton("系统压力")
         self._pressure_filter_btn.setCheckable(True)
         self._pressure_filter_btn.setStyleSheet(filter_style)
         self._filter_group.addButton(self._stutter_filter_btn)
@@ -434,7 +434,7 @@ class EventLogWidget(QWidget):
         has_rows = self._total_count > 0
         self._empty_label.setVisible(not has_rows)
         if self._filter_mode == "pressure":
-            self._empty_label.setText("暂时没有压力警告。\n系统资源压力较高时会在此提示。")
+            self._empty_label.setText("暂时没有系统压力事件。\n系统资源压力较高时会在此提示。")
         else:
             self._empty_label.setText("暂时还没有卡顿事件。\n正在持续监控你的系统…")
         self._clear_all_btn.setEnabled(self._total_count > 0)
