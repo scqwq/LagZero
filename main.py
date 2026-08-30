@@ -79,7 +79,10 @@ def main():
     storage   = Storage()
     session_detector = GameSessionDetector(interval_ms=2000)
     presentmon = PresentMonBridge()
-    frame_detector = FrameStutterDetector()
+    frame_detector = FrameStutterDetector(
+        spike_ratio=pressure_settings.frame_spike_ratio,
+        stutter_ratio=pressure_settings.frame_stutter_ratio,
+    )
     frame_detector_thread = QThread()
     frame_detector.moveToThread(frame_detector_thread)
     frame_detector_thread.start()

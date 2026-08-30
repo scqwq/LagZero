@@ -88,8 +88,10 @@ class FrameStutterDetector(QObject):
     stutter_ended = Signal(object)
     status_changed = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, spike_ratio: float = SPIKE_RATIO, stutter_ratio: float = STUTTER_RATIO):
         super().__init__(parent)
+        self._spike_ratio = max(1.2, float(spike_ratio))
+        self._stutter_ratio = max(1.5, float(stutter_ratio))
         self._recent_frames: deque[FrameSample] = deque(maxlen=180)
         self._active = False
         self._started_at: datetime | None = None
@@ -158,6 +160,12 @@ class FrameStutterDetector(QObject):
             self._display_base,
         )
 
+    @Slot(float, float)
+    def update_sensitivity(self, spike_ratio: float, stutter_ratio: float):
+        """Update detection multipliers without resetting learned baselines."""
+        self._spike_ratio = max(1.2, float(spike_ratio))
+        self._stutter_ratio = max(1.5, float(stutter_ratio))
+
     def _learn(self, sample: FrameSample):
         self._frame_base.add(sample.frame_time_ms)
         self._cpu_busy_base.add(sample.cpu_busy_ms)
@@ -195,14 +203,14 @@ class FrameStutterDetector(QObject):
         if not self._frame_base.is_ready:
             return WARMUP_SPIKE_MS
         return self._threshold(
-            self._frame_base, SPIKE_SIGMAS, SPIKE_MARGIN_MS, SPIKE_RATIO, SPIKE_FLOOR_MS
+            self._frame_base, SPIKE_SIGMAS, SPIKE_MARGIN_MS, self._spike_ratio, SPIKE_FLOOR_MS
         )
 
     def _stutter_threshold(self) -> float:
         if not self._frame_base.is_ready:
             return WARMUP_STUTTER_MS
         return self._threshold(
-            self._frame_base, STUTTER_SIGMAS, STUTTER_MARGIN_MS, STUTTER_RATIO, STUTTER_FLOOR_MS
+            self._frame_base, STUTTER_SIGMAS, STUTTER_MARGIN_MS, self._stutter_ratio, STUTTER_FLOOR_MS
         )
 
     def _freeze_threshold(self) -> float:

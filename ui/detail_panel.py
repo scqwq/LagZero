@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QTextBrowser
 
 from core.models import LagEvent, LagSnapshot
+from core.collectors import machine_cpu_count
 
 GREEN = "#2ecc71"
 AMBER = "#f39c12"
@@ -24,6 +25,7 @@ CAUSE_ICONS = {
     "REPORT_PENDING": "⏳",
     "CPU_SPIKE": "🔥",
     "CPU_BOUND": "🔥",
+    "CPU_STAGE_STALL": "🔧",
     "GPU_BOUND": "🎮",
     "VRAM_PRESSURE": "🧠",
     "DRIVER_RENDER_PATH": "🪟",
@@ -36,6 +38,7 @@ CAUSE_ICONS = {
     "DISK_IO": "💿",
     "IO_STALL": "💿",
     "SCHEDULER_CONTENTION": "⚙️",
+    "TRANSIENT_DISTURBANCE": "⚡",
     "DISPLAY_PIPELINE": "🖥️",
     "LOCAL_STUTTER": "📉",
     "UNDETERMINED": "❓",
@@ -57,6 +60,7 @@ CAUSE_COLOURS = {
     "REPORT_PENDING": ACCENT,
     "CPU_SPIKE": RED,
     "CPU_BOUND": RED,
+    "CPU_STAGE_STALL": AMBER,
     "GPU_BOUND": ACCENT,
     "VRAM_PRESSURE": "#1abc9c",
     "DRIVER_RENDER_PATH": ACCENT,
@@ -69,6 +73,7 @@ CAUSE_COLOURS = {
     "DISK_IO": "#1abc9c",
     "IO_STALL": "#1abc9c",
     "SCHEDULER_CONTENTION": MUTED,
+    "TRANSIENT_DISTURBANCE": MUTED,
     "DISPLAY_PIPELINE": PURPLE,
     "LOCAL_STUTTER": AMBER,
     "UNDETERMINED": MUTED,
@@ -90,6 +95,7 @@ CAUSE_LABELS_ZH = {
     "REPORT_PENDING": "正在生成报告",
     "CPU_SPIKE": "单进程 CPU 峰值",
     "CPU_BOUND": "CPU 瓶颈",
+    "CPU_STAGE_STALL": "游戏 CPU 阶段受限",
     "GPU_BOUND": "GPU 瓶颈",
     "VRAM_PRESSURE": "显存压力",
     "DRIVER_RENDER_PATH": "驱动 / 渲染链路异常",
@@ -102,6 +108,7 @@ CAUSE_LABELS_ZH = {
     "DISK_IO": "磁盘 / IO 瓶颈",
     "IO_STALL": "IO 阻塞",
     "SCHEDULER_CONTENTION": "调度竞争",
+    "TRANSIENT_DISTURBANCE": "瞬时干扰",
     "DISPLAY_PIPELINE": "画面上屏异常",
     "LOCAL_STUTTER": "本地卡顿",
     "UNDETERMINED": "未确定类型",
@@ -496,7 +503,31 @@ class DetailPanelWidget(QWidget):
                 f"峰值整机 CPU {snapshot.peak_cpu:.1f}%，内存占用 {snapshot.peak_ram:.1f}%。{available_text}"
             )
         if code in {"CPU_SPIKE", "CPU_BOUND"} and top_proc is not None:
-            return f"检测到进程 {top_proc.name} (PID {top_proc.pid}) 的 CPU 占用达到 {top_proc.cpu_percent:.1f}%，很可能它是导致本次卡顿的主要原因。"
+            share = top_proc.cpu_machine_share
+            if share <= 0.0:
+                # Old snapshots may not have machine_share; compute it here.
+                share = top_proc.cpu_percent / machine_cpu_count()
+            return f"检测到进程 {top_proc.name} (PID {top_proc.pid}) 的 CPU 占用达到整机 {share:.1f}%（约 {top_proc.cpu_percent:.1f}% 单核计），很可能它是导致本次卡顿的主要原因。"
+        if code == "CPU_STAGE_STALL":
+            target = snapshot.peak_sample.target_process
+            if target is not None and target.cpu_machine_share > 0:
+                return (
+                    f"游戏自身的 CPU 阶段耗时增加，但整机 CPU 并未吃满"
+                    f"（游戏约占整机 {target.cpu_machine_share:.1f}%）。"
+                    f"这更像是游戏引擎的单线程瓶颈、锁竞争或内部等待，"
+                    f"而不是整机 CPU 资源不足。"
+                )
+            return (
+                "游戏自身的 CPU 阶段耗时增加，但整机 CPU 并未吃满。"
+                "这更像是游戏引擎的单线程瓶颈、锁竞争或内部等待，"
+                "而不是整机 CPU 资源不足。"
+            )
+        if code == "TRANSIENT_DISTURBANCE":
+            return (
+                "帧耗时增加，但整机 CPU 占用和游戏自身 CPU 都不高。"
+                "这类卡顿更可能来自窗口切换、焦点变化或瞬时系统干扰，"
+                "而不是持续的 CPU/GPU 瓶颈。"
+            )
         if code == "GPU_BOUND":
             return "本次卡顿更像 GPU 侧渲染压力过高导致的帧时间抖动。通常意味着显卡负载、分辨率、特效或驱动路径成为瓶颈。"
         if code == "VRAM_PRESSURE":
@@ -520,6 +551,12 @@ class DetailPanelWidget(QWidget):
         if code == "DRIVER_RENDER_PATH":
             return "本次卡顿更像驱动、桌面合成、覆盖层或渲染链路异常，而不是典型的 CPU、内存或磁盘瓶颈。这个结论会保持保守，因为当前没有直接读取驱动内部状态。"
         if code in {"SCHEDULER_CONTENTION", "LOCAL_STUTTER"}:
+            if code == "SCHEDULER_CONTENTION":
+                return (
+                    "CPU 等待增加，同时检测到后台进程占用较高 CPU。"
+                    "游戏的线程可能被操作系统调度器抢占，导致帧提交被阻塞。"
+                    "可尝试关闭高占用的后台程序后再次测试。"
+                )
             return f"系统处于综合性压力状态。峰值 CPU {snapshot.peak_cpu:.0f}%，响应延迟 {snapshot.peak_responsiveness_ms:.1f} ms，暂未识别出唯一的根因。"
         if code in {"FRAME_SPIKE", "FRAME_STUTTER", "FRAME_FREEZE", "FRAME_DROP", "DISPLAY_STALL"}:
             return f"这是一次以帧时间异常为主的卡顿事件，持续约 {event.duration_seconds:.1f} 秒。当前报告更偏向玩家看到的结果，而不是完整硬件根因。"

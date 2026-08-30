@@ -483,10 +483,27 @@ class MainWindow(QMainWindow):
         self._allow_foreground_resources_checkbox.setChecked(self._pressure_settings.allow_foreground_high_usage)
         policy_layout.addWidget(self._allow_foreground_resources_checkbox)
 
+        self._threshold_spins: dict[str, QDoubleSpinBox] = {}
+
+        sensitivity_card, sensitivity_layout = self._settings_card("卡顿判定灵敏度")
+        sensitivity_hint = QLabel(
+            "阈值基于游戏自身正常帧时间自动适应：数值越小越敏感，会报更多轻微波动；数值越大越保守，只报明显卡顿。"
+        )
+        sensitivity_hint.setWordWrap(True)
+        sensitivity_hint.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        sensitivity_layout.addWidget(sensitivity_hint)
+        sensitivity_form = QFormLayout()
+        sensitivity_layout.addLayout(sensitivity_form)
+        self._add_threshold_spin(
+            sensitivity_form, "尖峰倍率", "frame_spike_ratio", " ×", 1.2, 5.0
+        )
+        self._add_threshold_spin(
+            sensitivity_form, "卡顿倍率", "frame_stutter_ratio", " ×", 1.5, 8.0
+        )
+
         thresholds_card, thresholds_layout = self._settings_card("压力阈值")
         thresholds_form = QFormLayout()
         thresholds_layout.addLayout(thresholds_form)
-        self._threshold_spins: dict[str, QDoubleSpinBox] = {}
         self._add_threshold_spin(thresholds_form, "系统 CPU（%）", "system_cpu_percent", "%", 1.0, 100.0)
         self._add_threshold_spin(thresholds_form, "可用内存警告线（GB）", "ram_available_warning_gb", " GB", 0.1, 256.0)
         self._add_threshold_spin(thresholds_form, "后台单进程 CPU（%）", "background_process_cpu_percent", "%", 0.1, 100.0)
@@ -502,7 +519,7 @@ class MainWindow(QMainWindow):
         actions_row.addWidget(self._reset_thresholds_btn)
         thresholds_layout.addLayout(actions_row)
 
-        for card in (report_card, mode_card, policy_card, thresholds_card):
+        for card in (report_card, mode_card, policy_card, sensitivity_card, thresholds_card):
             layout.addWidget(card)
         layout.addStretch()
         scroll.setWidget(content)
@@ -899,6 +916,13 @@ class MainWindow(QMainWindow):
     def _on_pressure_threshold_changed(self, field: str, value: float):
         setattr(self._pressure_settings, field, value)
         save_settings(self._pressure_settings)
+        if field in {"frame_spike_ratio", "frame_stutter_ratio"}:
+            detector = getattr(self, "_frame_detector", None)
+            if detector is not None:
+                detector.update_sensitivity(
+                    self._pressure_settings.frame_spike_ratio,
+                    self._pressure_settings.frame_stutter_ratio,
+                )
 
     @Slot()
     def _reset_pressure_settings(self):
@@ -913,6 +937,12 @@ class MainWindow(QMainWindow):
         self._allow_foreground_resources_checkbox.setChecked(
             self._pressure_settings.allow_foreground_high_usage
         )
+        detector = getattr(self, "_frame_detector", None)
+        if detector is not None:
+            detector.update_sensitivity(
+                self._pressure_settings.frame_spike_ratio,
+                self._pressure_settings.frame_stutter_ratio,
+            )
         save_settings(self._pressure_settings)
         self._set_status_message("已恢复默认压力阈值", force=True)
 

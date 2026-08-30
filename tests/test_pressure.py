@@ -23,7 +23,7 @@ from core.pressure import (
 class PressureTests(unittest.TestCase):
     def test_default_thresholds_follow_hardware_curves(self):
         settings = default_settings(32, 64.0)
-        self.assertAlmostEqual(settings.system_cpu_percent, 15.0 + 10.0 * pow(2.718281828, -2.0), places=5)
+        self.assertAlmostEqual(settings.system_cpu_percent, 25.0 + 20.0 * pow(2.718281828, -1.0), places=5)
         self.assertAlmostEqual(settings.background_process_cpu_percent, 8.0 + 12.0 * pow(2.718281828, -32.0 / 12.0), places=5)
         self.assertAlmostEqual(settings.foreground_process_cpu_percent, 35.0 + 15.0 * pow(2.718281828, -2.0), places=5)
         self.assertAlmostEqual(settings.ram_available_warning_gb, 7.8, places=5)
@@ -32,7 +32,7 @@ class PressureTests(unittest.TestCase):
         settings = default_settings(32, 64.0)
         sample = SystemSample(
             timestamp=datetime.now(),
-            cpu_percent=20.0,
+            cpu_percent=40.0,
             cpu_per_core=[],
             ram_percent=85.0,
             ram_used_mb=54.0 * 1024,

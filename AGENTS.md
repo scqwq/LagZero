@@ -74,7 +74,8 @@ v1 schema 仍可解析（自动按表头识别），字段映射已修正（旧�
 ## 卡顿检测
 
 **帧级（`frame_detector.py`，本轮重写）**：每帧对照学到的基线判定，四级事件 `FRAME_SPIKE < FRAME_STUTTER < FRAME_DROP < FRAME_FREEZE`（`DISPLAY_STALL` 优先级 2）。
-- 阈值 = `max(地板, mean×ratio, mean+margin, mean+Nσ)`，spike/stutter 各自的 ratio=2.0/3.5、margin=14/28ms、σ=3/5。地板只是兜底不是决定项。
+- 阈值 = `max(地板, mean×ratio, mean+margin, mean+Nσ)`，spike/stutter 各自的 ratio 默认 2.0/3.5、margin=14/28ms、σ=3/5。地板只是兜底不是决定项。
+- **倍率可调**：`frame_spike_ratio` / `frame_stutter_ratio` 存在 `PressureSettings`（`data/pressure_settings.json`），设置页"卡顿判定灵敏度"提供两个 SpinBox（1.2–5.0× / 1.5–8.0×），修改即时生效，不重置基线。数值越小越敏感（报更多轻微波动），越大越保守（只报明显卡顿）。
 - **预热期**（基线 <120 帧未就绪）退回旧的保守绝对值 50/66/150ms。曾经直接用地板 33ms 当预热阈值，30fps 游戏每帧都被判卡顿 → 卡顿帧不进基线 → 基线永远不就绪的死循环。
 - **掉帧检测**：`was_displayed=False`（v2 `DisplayedTime==NA`）且近 12 帧内掉帧 ≥3 才触发 `FRAME_DROP`。这类卡顿帧时间完全正常，旧检测器彻底漏检；单帧掉帧在 240Hz 下只多 4ms 间隙、玩家无感，其可见后果由 DISPLAY_STALL 路径兜底。
 - **上屏延迟**：displayed_time 超过自身基线 2 倍 + 超过帧成本 1.5 倍或 8ms 才算独立事件 —— displayed 跟着 frame_time 涨只是帧慢的结果，不算独立发现。
@@ -99,6 +100,19 @@ v1 schema 仍可解析（自动按表头识别），字段映射已修正（旧�
 
 置信度 <0.5 的 verdict 只作弱提示（`WEAK_CATEGORIES` 机制），系统侧规则（具体进程、内存耗尽等）可以覆盖它；置信度 ≥0.5 时帧侧 verdict 直接成为事件 category。
 
+### 上下文精炼（`analyzer.py`，本轮新增）
+
+帧归因只看 PresentMon 的帧内阶段增量，不知道整机 CPU 是否吃满。"CPUBusy 桶最大"不能直接等同于"CPU 瓶颈"——切窗口、单线程瓶颈、真饱和都会让 CPUBusy 增长。`analyze_frame_episode` 在仲裁前调用 `_refine_frame_verdict(attribution, peak_sample)`，用系统快照把初步 verdict 精炼为最终 category：
+
+| 条件 | 精炼结果 | 含义 |
+|---|---|---|
+| `CPU_BOUND` + `system_cpu >= 85%` | 保留 `CPU_BOUND` | 整机真饱和，游戏抢不到 CPU |
+| `CPU_BOUND` + `target_cpu >= 20%` 或 `system_cpu >= 70%` | → `CPU_STAGE_STALL` | 游戏在用 CPU 但系统有余量，引擎内部瓶颈（单线程/锁/等待） |
+| `CPU_BOUND` + 其余 | → `TRANSIENT_DISTURBANCE` | 整机和游戏 CPU 都低，可能是窗口切换/瞬时干扰 |
+| `DRIVER_RENDER_PATH` + `wait_share >= 0.4` + 后台进程 `>= 10%` 整机 | → `SCHEDULER_CONTENTION` | CPU 等待增长 + 后台进程抢 CPU，调度抢占 |
+
+新增分类 `CPU_STAGE_STALL` / `TRANSIENT_DISTURBANCE` 不在 `WEAK_CATEGORIES`，会赢过 UNDETERMINED，但具名系统发现（进程/RAM 等）仍然可以覆盖它们。证据行保持帧归因的原始阶段分解（描述事实），精炼后的 category 决定报告标题/颜色（做解释）。
+
 ## 卡顿报告生成思路
 
 事件结束 → `MainWindow._on_frame_stutter_ended`：先 `recorder.capture(event)` 拿系统快照（空 pre_lag 缓冲 = 占位全零样本，必须传 `None` 给分析器，否则规则会从零里编造结论）→ `CauseAnalyzer.analyze_frame_episode(episode, peak_sample, pre_lag_samples)`：
@@ -107,7 +121,9 @@ v1 schema 仍可解析（自动按表头识别），字段映射已修正（旧�
 - 中文报告在 `detail_panel._frame_summary_zh` 里**按标签正则抽取**数字（不是按位置索引——加一句话就全错位），`_has_system_context` 挡住占位快照的零值冒充实测
 - 报告结构：标题行（图标+分类+时长+scope）→ 原因段 → 峰值指标四格 → 游戏原始指标 → 卡顿前 5s 时间线（sparkline）→ 峰值进程表。清晰但不冗余：证据行有 12% 份额门槛，输入延迟只在实际测到时出现
 
-**新增分类必须同时进三个字典**（`detail_panel.py` 的 `CAUSE_LABELS_ZH` / `CAUSE_ICONS` / `CAUSE_COLOURS`），否则 `test_every_category_has_report_labels` 失败。本轮新增 `DISPLAY_PIPELINE`、`FRAME_DROP`、`DISPLAY_STALL` 已全部补齐。
+**新增分类必须同时进三个字典**（`detail_panel.py` 的 `CAUSE_LABELS_ZH` / `CAUSE_ICONS` / `CAUSE_COLOURS`），否则 `test_every_category_has_report_labels` 失败。本轮新增 `CPU_STAGE_STALL`、`TRANSIENT_DISTURBANCE` 已全部补齐。
+
+**进程 CPU 报告口径（本轮修复）**：报告文案统一使用整机占比（`cpu_machine_share`），旧数据库无此字段时回退 `cpu_percent / machine_cpu_count()`。用户看到"整机 15.6%（约 500.0% 单核计）"而不是裸的 500%。`_rule_single_cpu_spike` 的英文 explanation 同样只用整机占比。
 
 ## PID 0 修复（用户指出）
 

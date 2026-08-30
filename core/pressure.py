@@ -17,6 +17,10 @@ SETTINGS_PATH = Path(__file__).parent.parent / "data" / "pressure_settings.json"
 @dataclass
 class PressureSettings:
     allow_foreground_high_usage: bool = True
+    # Frame-time stutter sensitivity: a frame is flagged when it costs this
+    # many times the game's own learned baseline. Higher = fewer reports.
+    frame_spike_ratio: float = 2.0
+    frame_stutter_ratio: float = 3.5
     system_cpu_percent: float = 0.0
     ram_available_warning_gb: float = 0.0
     background_process_cpu_percent: float = 0.0
@@ -138,7 +142,7 @@ def background_process_cpu_threshold_percent(logical_cpu_count: int) -> float:
 
 # 后台总CPU
 def background_total_cpu_threshold_percent(logical_cpu_count: int) -> float:
-    return 25.0 + 20.0 * math.exp(-logical_cpu_count / 16.0)
+    return 25.0 + 20.0 * math.exp(1 - logical_cpu_count / 16.0)
 
 # 前台CPU
 def foreground_process_cpu_threshold_percent(logical_cpu_count: int) -> float:

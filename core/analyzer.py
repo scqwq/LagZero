@@ -15,7 +15,7 @@ register it in RULE_PRIORITY.  The engine tries them in order.
 from dataclasses import dataclass
 
 from core.collectors import is_idle_pseudo_process, machine_cpu_count, per_core_to_machine_share
-from core.models import FrameStutterEpisode, SystemSample, ProcessSample
+from core.models import FrameAttribution, FrameStutterEpisode, SystemSample, ProcessSample
 
 CATEGORY_CPU_BOUND = "CPU_BOUND"
 CATEGORY_GPU_BOUND = "GPU_BOUND"
@@ -24,11 +24,14 @@ CATEGORY_SYSTEM_RAM_PRESSURE = "SYSTEM_RAM_PRESSURE"
 CATEGORY_GAME_MEMORY_LIMIT = "GAME_MEMORY_LIMIT"
 CATEGORY_VRAM_PRESSURE = "VRAM_PRESSURE"
 CATEGORY_DRIVER_RENDER_PATH = "DRIVER_RENDER_PATH"
+CATEGORY_SCHEDULER_CONTENTION = "SCHEDULER_CONTENTION"
 CATEGORY_IO_STALL = "IO_STALL"
 # Frames were produced on time but did not reach the screen on time. Comes from
 # the frame attribution rather than any system rule — no system counter can see
 # this, which is why the class used to be missed entirely.
 CATEGORY_DISPLAY_PIPELINE = "DISPLAY_PIPELINE"
+CATEGORY_CPU_STAGE_STALL = "CPU_STAGE_STALL"
+CATEGORY_TRANSIENT_DISTURBANCE = "TRANSIENT_DISTURBANCE"
 CATEGORY_BACKGROUND_INTERFERENCE = "BACKGROUND_INTERFERENCE"
 CATEGORY_LOCAL_STUTTER = "LOCAL_STUTTER"
 CATEGORY_UNDETERMINED = "UNDETERMINED"
@@ -57,6 +60,16 @@ GAME_PROC_EXEMPT_SHARE = 60.0       # % of whole machine
 # Thresholds carried on pre-normalisation snapshots in SQLite, expressed on the
 # old per-core scale for backward compatibility with stored data.
 LEGACY_SINGLE_PROC_CPU_THRESHOLD = 200.0
+
+# --- Frame-attribution refinement thresholds ---------------------------------
+# The frame-side attribution only knows that the CPUBusy stage grew. Whether
+# that means "CPU bottleneck" depends on the system context: if the machine
+# still has CPU headroom, the game's own stage being slower is an engine-level
+# stall, not a system-level CPU shortage.
+CPU_SATURATION_SHARE = 85.0   # system CPU at/above this = true saturation
+CPU_STAGE_MIN_TARGET_SHARE = 20.0  # game CPU at/above this = engine is using CPU
+MODERATE_CPU_SHARE = 70.0     # system CPU at/above this = meaningful pressure
+SCHEDULER_BG_MIN_SHARE = 10.0 # background process at/above this = preemption risk
 
 # Verdicts that carry no actionable root cause. When the system rules land here
 # but the frame detector reached something specific (e.g. GPU_BOUND from frame
@@ -135,6 +148,18 @@ class CauseAnalyzer:
                 used_system_cause=False,
             )
 
+        # Refine the frame-side verdict with the system context before
+        # arbitration: "CPUBusy grew" alone does not mean "CPU bottleneck".
+        # On a machine with headroom, the same stage growth is an engine-level
+        # stall (single-thread / lock / internal wait), not a system shortage.
+        refined_category, context_note = self._refine_frame_verdict(
+            episode.attribution, peak_sample
+        )
+        if refined_category != detector_category and context_note:
+            detector_category = refined_category
+            episode.category = refined_category
+            episode.explanation = f"{episode.explanation} {context_note}".strip()
+
         system_category, system_cause, system_scope = self.analyze(peak_sample, pre_lag_samples)
         frame_summary = self.summarize_frame_episode(episode)
 
@@ -163,6 +188,116 @@ class CauseAnalyzer:
             system_cause=system_cause,
             used_system_cause=True,
         )
+
+    def _refine_frame_verdict(
+        self,
+        attribution: FrameAttribution | None,
+        peak_sample: SystemSample,
+    ) -> tuple[str, str]:
+        """
+        Refine a frame-attribution verdict using the system snapshot.
+
+        The frame attribution sees only PresentMon's per-stage timings. It
+        cannot tell whether a grown CPUBusy stage means the machine is out of
+        CPU or the engine failed to use the CPU that was available. This
+        method adds that system context, turning the raw stage verdict into
+        one of three finer categories when appropriate:
+
+        - CPU_BOUND: system CPU is genuinely saturated (>= 85%).
+        - CPU_STAGE_STALL: stage grew but system has headroom; engine-level
+          single-thread / lock / internal-wait problem.
+        - TRANSIENT_DISTURBANCE: stage grew but both system and game CPU are
+          low; likely a window switch or momentary disturbance.
+        - SCHEDULER_CONTENTION: CPU wait grew while a background process
+          holds enough CPU to have preempted the game's threads.
+
+        Returns (refined_category, context_note). The note is empty when the
+        original verdict stands, so callers only append it on change.
+        """
+        if attribution is None or not attribution.category:
+            return "", ""
+
+        target_cpu_share = 0.0
+        if peak_sample.target_process is not None:
+            target_cpu_share = peak_sample.target_process.cpu_machine_share
+            if target_cpu_share <= 0.0:
+                # Old samples may not carry machine_share; compute it here.
+                target_cpu_share = per_core_to_machine_share(
+                    peak_sample.target_process.cpu_percent
+                )
+
+        system_cpu = peak_sample.cpu_percent
+        category = attribution.category
+
+        if category == CATEGORY_CPU_BOUND:
+            if system_cpu >= CPU_SATURATION_SHARE:
+                # True CPU saturation: the verdict is correct.
+                return category, ""
+
+            if (
+                target_cpu_share >= CPU_STAGE_MIN_TARGET_SHARE
+                or system_cpu >= MODERATE_CPU_SHARE
+            ):
+                # The engine is using CPU (or system pressure is moderate)
+                # but the machine is not saturated. This is an engine-level
+                # stage stall, not a system CPU shortage.
+                return CATEGORY_CPU_STAGE_STALL, (
+                    f"The game's CPU stage grew, but system CPU was only "
+                    f"{system_cpu:.0f}% and the game held {target_cpu_share:.1f}% "
+                    f"of the machine. The system had CPU headroom; this may be "
+                    f"a single-thread bottleneck, lock contention, or an "
+                    f"engine-internal wait."
+                )
+
+            # Low CPU all around: the frame was slow but CPU was not the
+            # constraint. More likely a transient disturbance.
+            return CATEGORY_TRANSIENT_DISTURBANCE, (
+                f"Frame time increased, but system CPU was only "
+                f"{system_cpu:.0f}% and the game held {target_cpu_share:.1f}%. "
+                f"This was likely a transient disturbance (window switch, "
+                f"focus change, or momentary system activity) rather than "
+                f"a CPU bottleneck."
+            )
+
+        if (
+            category == CATEGORY_DRIVER_RENDER_PATH
+            and attribution.wait_share >= 0.40
+        ):
+            # Unexplained CPU wait plus a background CPU consumer suggests
+            # scheduler preemption rather than a driver/present-path stall.
+            target_pid = (
+                peak_sample.target_process.pid
+                if peak_sample.target_process is not None
+                else None
+            )
+            bg_processes = [
+                p for p in peak_sample.top_processes
+                if p.pid != target_pid
+                and not is_idle_pseudo_process(p.pid, p.name)
+            ]
+            if bg_processes:
+                top_bg = max(
+                    bg_processes,
+                    key=lambda p: max(
+                        p.cpu_machine_share,
+                        per_core_to_machine_share(p.cpu_percent),
+                    ),
+                )
+                bg_share = max(
+                    top_bg.cpu_machine_share,
+                    per_core_to_machine_share(top_bg.cpu_percent),
+                )
+                if bg_share >= SCHEDULER_BG_MIN_SHARE:
+                    return CATEGORY_SCHEDULER_CONTENTION, (
+                        f"CPU wait increased while the background process "
+                        f"'{top_bg.name}' held {bg_share:.1f}% of the "
+                        f"machine's CPU. The game's threads may have been "
+                        f"preempted by the scheduler."
+                    )
+
+        # GPU_BOUND, DISPLAY_PIPELINE and confident DRIVER_RENDER_PATH
+        # verdicts are frame-side facts that system context does not contradict.
+        return category, ""
 
     @staticmethod
     def summarize_frame_episode(episode: FrameStutterEpisode) -> str:
@@ -306,12 +441,11 @@ class CauseAnalyzer:
             and top_share < GAME_PROC_EXEMPT_SHARE
         ):
             return None
-        pct = round(top.cpu_percent, 1)
         share = round(top_share, 1)
         return (
             CATEGORY_CPU_BOUND,
-            f'"{top.name}" (PID {top.pid}) was consuming {pct}% CPU '
-            f"(≈{share}% of all {machine_cpu_count()} logical cores), "
+            f'"{top.name}" (PID {top.pid}) was consuming {share}% of the machine '
+            f"total CPU capacity ({machine_cpu_count()} logical cores), "
             f"which is enough to starve the rest of the system. "
             f"Try closing or restarting this application.",
             SCOPE_LOCAL,
