@@ -1541,6 +1541,8 @@ class MainWindow(QMainWindow):
             )
             self.history_loaded.emit(events)
 
+        threading.Thread(target=_worker, daemon=True).start()
+
     @Slot(str)
     def _on_event_filter_changed(self, mode: str):
         self._history_offset = 0
@@ -1549,8 +1551,6 @@ class MainWindow(QMainWindow):
         self._selected_event_ref = None
         self._detail_panel.clear_event()
         self._load_history()
-
-        threading.Thread(target=_worker, daemon=True).start()
 
     @Slot()
     def _flush_frame_metrics(self):
