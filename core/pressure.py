@@ -21,6 +21,8 @@ class PressureSettings:
     # many times the game's own learned baseline. Higher = fewer reports.
     frame_spike_ratio: float = 2.0
     frame_stutter_ratio: float = 3.5
+    obvious_stutter_sensitivity: float = 1.0
+    continuous_wave_sensitivity: float = 1.0
     system_cpu_percent: float = 0.0
     ram_available_warning_gb: float = 0.0
     background_process_cpu_percent: float = 0.0

@@ -92,6 +92,7 @@ PRESSURE_ONLY_CATEGORIES = {
 }
 MINOR_INTERFERENCE_CATEGORIES = {
     "FRAME_SPIKE",
+    "FRAME_PACING_COLLAPSE",
     "CPU_STAGE_STALL",
     "TRANSIENT_DISTURBANCE",
     "LOCAL_STUTTER",
@@ -603,18 +604,28 @@ class MainWindow(QMainWindow):
 
         sensitivity_card, sensitivity_layout = self._settings_card("卡顿判定灵敏度")
         sensitivity_hint = QLabel(
-            "阈值基于游戏自身正常帧时间自动适应：数值越小越敏感，会报更多轻微波动；数值越大越保守，只报明显卡顿。"
+            "阈值基于游戏自身正常帧时间自动适应：数值越小越敏感，会更早捕捉波动；数值越大越保守，只在异常更明显时上报。"
         )
         sensitivity_hint.setWordWrap(True)
         sensitivity_hint.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         sensitivity_layout.addWidget(sensitivity_hint)
         sensitivity_form = QFormLayout()
         sensitivity_layout.addLayout(sensitivity_form)
-        self._add_threshold_spin(
-            sensitivity_form, "尖峰倍率", "frame_spike_ratio", " ×", 1.2, 5.0
+        self._add_sensitivity_spin(
+            sensitivity_form,
+            "明显卡顿灵敏度",
+            "obvious_stutter_sensitivity",
+            "敏感 0.85x  |  平衡 1.00x  |  保守 1.20x",
+            0.70,
+            1.40,
         )
-        self._add_threshold_spin(
-            sensitivity_form, "卡顿倍率", "frame_stutter_ratio", " ×", 1.5, 8.0
+        self._add_sensitivity_spin(
+            sensitivity_form,
+            "连续波动灵敏度",
+            "continuous_wave_sensitivity",
+            "敏感 0.85x  |  平衡 1.00x  |  保守 1.20x",
+            0.70,
+            1.40,
         )
 
         thresholds_card, thresholds_layout = self._settings_card("压力阈值")
@@ -674,6 +685,35 @@ class MainWindow(QMainWindow):
         self._threshold_spins[field] = spin
         form.addRow(label, spin)
 
+    def _add_sensitivity_spin(
+        self,
+        form: QFormLayout,
+        label: str,
+        field: str,
+        hint: str,
+        minimum: float,
+        maximum: float,
+    ) -> None:
+        spin = ClickSpinBox()
+        spin.setDecimals(2)
+        spin.setSingleStep(0.05)
+        spin.setRange(minimum, maximum)
+        spin.setSuffix(" x")
+        spin.setValue(getattr(self._pressure_settings, field))
+        spin.valueChanged.connect(lambda value, field=field: self._on_pressure_threshold_changed(field, value))
+        self._threshold_spins[field] = spin
+        note = QLabel(hint)
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(4)
+        box.addWidget(spin)
+        box.addWidget(note)
+        holder = QWidget()
+        holder.setLayout(box)
+        form.addRow(label, holder)
+
     # ------------------------------------------------------------------
     # Signals
     # ------------------------------------------------------------------
@@ -728,6 +768,12 @@ class MainWindow(QMainWindow):
             detector.stutter_ended.connect(self._on_frame_stutter_ended)
             detector.status_changed.connect(self._on_presentmon_status)
             self.frame_detector_reset_requested.connect(detector.reset_target)
+            detector.update_sensitivity(
+                self._pressure_settings.frame_spike_ratio,
+                self._pressure_settings.frame_stutter_ratio,
+                self._pressure_settings.obvious_stutter_sensitivity,
+                self._pressure_settings.continuous_wave_sensitivity,
+            )
         compat_detector = getattr(self, "_compat_detector", None)
         if compat_detector is not None:
             compat_detector.stutter_started.connect(self._on_frame_stutter_started)
@@ -862,6 +908,8 @@ class MainWindow(QMainWindow):
             return False
         if episode.display_stall_major_count > 0:
             return False
+        if episode.pacing_collapse_major_count > 0:
+            return False
         if episode.peak_frame_time_ms >= 160.0:
             return False
         baseline = max(episode.baseline_frame_time_ms, 1.0)
@@ -870,6 +918,12 @@ class MainWindow(QMainWindow):
         duration_s = max(0.0, (episode.ended_at - episode.started_at).total_seconds())
         if duration_s >= 0.40 and episode.peak_frame_time_ms >= 70.0:
             return False
+        if episode.event_type == "FRAME_PACING_COLLAPSE":
+            return (
+                episode.lowest_pacing_fps_ratio >= 0.38
+                and episode.peak_pacing_avg_ratio < 2.5
+                and episode.peak_pacing_slow_ratio < 0.65
+            )
         return episode.event_type == "FRAME_SPIKE" or episode.peak_frame_time_ms < 90.0
 
     @staticmethod
@@ -1187,12 +1241,19 @@ class MainWindow(QMainWindow):
     @Slot(str, float)
     def _on_pressure_threshold_changed(self, field: str, value: float):
         setattr(self._pressure_settings, field, value)
-        if field in {"frame_spike_ratio", "frame_stutter_ratio"}:
+        if field in {
+            "frame_spike_ratio",
+            "frame_stutter_ratio",
+            "obvious_stutter_sensitivity",
+            "continuous_wave_sensitivity",
+        }:
             detector = getattr(self, "_frame_detector", None)
             if detector is not None:
                 detector.update_sensitivity(
                     self._pressure_settings.frame_spike_ratio,
                     self._pressure_settings.frame_stutter_ratio,
+                    self._pressure_settings.obvious_stutter_sensitivity,
+                    self._pressure_settings.continuous_wave_sensitivity,
                 )
 
     @Slot()
@@ -1218,7 +1279,9 @@ class MainWindow(QMainWindow):
             detector.update_sensitivity(
                 self._pressure_settings.frame_spike_ratio,
                 self._pressure_settings.frame_stutter_ratio,
-                )
+                self._pressure_settings.obvious_stutter_sensitivity,
+                self._pressure_settings.continuous_wave_sensitivity,
+            )
         # A deliberate reset should persist immediately, not on a debounce.
         self._settings_save_timer.stop()
         self._save_pressure_settings_now()
@@ -2177,6 +2240,8 @@ class MainWindow(QMainWindow):
         # 0.3-confidence guess being printed as the cause.
         if attribution is not None and attribution.category and attribution.is_confident:
             return attribution.category
+        if episode.pacing_collapse_major_count > 0 or episode.event_type == "FRAME_PACING_COLLAPSE":
+            return "FRAME_PACING_COLLAPSE"
         if episode.dropped_frame_count >= 2 or episode.display_stall_major_count > 0:
             return "DISPLAY_PIPELINE"
         if episode.display_stall_minor_count > 0:

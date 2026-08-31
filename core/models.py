@@ -301,6 +301,12 @@ class FrameStutterEpisode:
     display_stall_minor_count: int = 0
     display_stall_major_count: int = 0
     peak_display_excess_ms: float = 0.0
+    pacing_collapse_minor_count: int = 0
+    pacing_collapse_major_count: int = 0
+    peak_pacing_avg_ratio: float = 0.0
+    peak_pacing_p95_ratio: float = 0.0
+    peak_pacing_slow_ratio: float = 0.0
+    lowest_pacing_fps_ratio: float = 1.0
     attribution: Optional[FrameAttribution] = None
 
 

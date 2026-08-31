@@ -29,6 +29,7 @@ from core.models import LagEvent, LagSnapshot
 DB_PATH = Path(__file__).parent.parent / "data" / "lag_history.db"
 MINOR_INTERFERENCE_CATEGORIES = (
     "FRAME_SPIKE",
+    "FRAME_PACING_COLLAPSE",
     "CPU_STAGE_STALL",
     "TRANSIENT_DISTURBANCE",
     "LOCAL_STUTTER",

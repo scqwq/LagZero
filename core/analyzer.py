@@ -30,6 +30,7 @@ CATEGORY_IO_STALL = "IO_STALL"
 # the frame attribution rather than any system rule — no system counter can see
 # this, which is why the class used to be missed entirely.
 CATEGORY_DISPLAY_PIPELINE = "DISPLAY_PIPELINE"
+CATEGORY_FRAME_PACING_COLLAPSE = "FRAME_PACING_COLLAPSE"
 CATEGORY_CPU_STAGE_STALL = "CPU_STAGE_STALL"
 CATEGORY_TRANSIENT_DISTURBANCE = "TRANSIENT_DISTURBANCE"
 CATEGORY_BACKGROUND_INTERFERENCE = "BACKGROUND_INTERFERENCE"
@@ -213,6 +214,13 @@ class CauseAnalyzer:
             return True
         if episode.display_stall_major_count > 0:
             return True
+        if episode.pacing_collapse_major_count > 0:
+            return True
+        if (
+            episode.event_type == CATEGORY_FRAME_PACING_COLLAPSE
+            and episode.lowest_pacing_fps_ratio <= 0.30
+        ):
+            return True
         if episode.peak_frame_time_ms >= 220.0:
             return True
         baseline = max(episode.baseline_frame_time_ms, 1.0)
@@ -342,15 +350,27 @@ class CauseAnalyzer:
         """
         is_compat = episode.present_mode == "compatibility"
         label = "Peak response delay" if is_compat else "Peak frame time"
-        parts = [
-            f"{label} reached {episode.peak_frame_time_ms:.1f} ms "
-            f"(avg {episode.avg_frame_time_ms:.1f} ms, P95 {episode.p95_frame_time_ms:.1f} ms)."
-        ]
+        if episode.event_type == "FRAME_PACING_COLLAPSE" and not is_compat:
+            parts = [
+                f"Frame pacing briefly collapsed: peak frame time {episode.peak_frame_time_ms:.1f} ms, "
+                f"window average reached {episode.peak_pacing_avg_ratio:.1f}x normal, "
+                f"P95 reached {episode.peak_pacing_p95_ratio:.1f}x, "
+                f"and effective throughput fell to about {episode.lowest_pacing_fps_ratio * 100:.0f}% of normal."
+            ]
+        else:
+            parts = [
+                f"{label} reached {episode.peak_frame_time_ms:.1f} ms "
+                f"(avg {episode.avg_frame_time_ms:.1f} ms, P95 {episode.p95_frame_time_ms:.1f} ms)."
+            ]
         # The learned norm is what makes the peak mean anything: 30 ms is a
         # non-event at 30 fps and a five-fold hitch at 240 Hz.
         if not is_compat and episode.baseline_frame_time_ms > 0.0:
             parts.append(
                 f"Normal for this session was {episode.baseline_frame_time_ms:.1f} ms."
+            )
+        if episode.event_type == "FRAME_PACING_COLLAPSE" and episode.peak_pacing_slow_ratio > 0.0:
+            parts.append(
+                f"About {episode.peak_pacing_slow_ratio * 100:.0f}% of frames in the worst window were slow."
             )
         if episode.freeze_frame_count:
             parts.append(f"{episode.freeze_frame_count} freeze-level samples.")

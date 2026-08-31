@@ -21,7 +21,7 @@ Two signals are tracked separately:
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PySide6.QtCore import QObject, Signal, Slot
 
@@ -78,6 +78,10 @@ DISPLAY_DIRECT_EXCESS_MS = 42.0
 DISPLAY_DIRECT_RATIO = 3.0
 DISPLAY_FREEZE_EXCESS_MS = 120.0
 DISPLAY_FREEZE_GAP_MS = 180.0
+PACING_SHORT_WINDOW_S = 0.55
+PACING_LONG_WINDOW_S = 1.0
+PACING_MIN_SHORT_FRAMES = 4
+PACING_MIN_LONG_FRAMES = 6
 
 BASELINE_MIN_FRAMES = 120
 MIN_WINDOW_SAMPLES = 12
@@ -101,7 +105,9 @@ class FrameStutterDetector(QObject):
         super().__init__(parent)
         self._spike_ratio = max(1.2, float(spike_ratio))
         self._stutter_ratio = max(1.5, float(stutter_ratio))
-        self._recent_frames: deque[FrameSample] = deque(maxlen=180)
+        self._severe_sensitivity = 1.0
+        self._continuous_sensitivity = 1.0
+        self._recent_frames: deque[FrameSample] = deque(maxlen=512)
         self._active = False
         self._started_at: datetime | None = None
         self._target_process = ""
@@ -169,11 +175,19 @@ class FrameStutterDetector(QObject):
             self._display_base,
         )
 
-    @Slot(float, float)
-    def update_sensitivity(self, spike_ratio: float, stutter_ratio: float):
+    @Slot(float, float, float, float)
+    def update_sensitivity(
+        self,
+        spike_ratio: float,
+        stutter_ratio: float,
+        severe_sensitivity: float = 1.0,
+        continuous_sensitivity: float = 1.0,
+    ):
         """Update detection multipliers without resetting learned baselines."""
         self._spike_ratio = max(1.2, float(spike_ratio))
         self._stutter_ratio = max(1.5, float(stutter_ratio))
+        self._severe_sensitivity = min(1.5, max(0.7, float(severe_sensitivity)))
+        self._continuous_sensitivity = min(1.5, max(0.7, float(continuous_sensitivity)))
 
     def _learn(self, sample: FrameSample):
         self._frame_base.add(sample.frame_time_ms)
@@ -210,6 +224,27 @@ class FrameStutterDetector(QObject):
             self._slow_frame_count += 1
         if sample.frame_time_ms >= self._freeze_threshold():
             self._freeze_frame_count += 1
+        if event_kind == "FRAME_PACING_COLLAPSE":
+            if self._last_pacing_level >= 2:
+                self._pacing_collapse_major_count += 1
+            elif self._last_pacing_level >= 1:
+                self._pacing_collapse_minor_count += 1
+            self._peak_pacing_avg_ratio = max(
+                self._peak_pacing_avg_ratio,
+                self._last_pacing_avg_ratio,
+            )
+            self._peak_pacing_p95_ratio = max(
+                self._peak_pacing_p95_ratio,
+                self._last_pacing_p95_ratio,
+            )
+            self._peak_pacing_slow_ratio = max(
+                self._peak_pacing_slow_ratio,
+                self._last_pacing_slow_ratio,
+            )
+            self._lowest_pacing_fps_ratio = min(
+                self._lowest_pacing_fps_ratio,
+                self._last_pacing_fps_ratio,
+            )
         if self._event_priority(event_kind) > self._event_priority(self._peak_kind):
             self._peak_kind = event_kind
 
@@ -221,14 +256,22 @@ class FrameStutterDetector(QObject):
         if not self._frame_base.is_ready:
             return WARMUP_SPIKE_MS
         return self._threshold(
-            self._frame_base, SPIKE_SIGMAS, SPIKE_MARGIN_MS, self._spike_ratio, SPIKE_FLOOR_MS
+            self._frame_base,
+            SPIKE_SIGMAS * self._severe_sensitivity,
+            SPIKE_MARGIN_MS * self._severe_sensitivity,
+            self._spike_ratio * self._severe_sensitivity,
+            SPIKE_FLOOR_MS,
         )
 
     def _stutter_threshold(self) -> float:
         if not self._frame_base.is_ready:
             return WARMUP_STUTTER_MS
         return self._threshold(
-            self._frame_base, STUTTER_SIGMAS, STUTTER_MARGIN_MS, self._stutter_ratio, STUTTER_FLOOR_MS
+            self._frame_base,
+            STUTTER_SIGMAS * self._severe_sensitivity,
+            STUTTER_MARGIN_MS * self._severe_sensitivity,
+            self._stutter_ratio * self._severe_sensitivity,
+            STUTTER_FLOOR_MS,
         )
 
     def _freeze_threshold(self) -> float:
@@ -236,7 +279,7 @@ class FrameStutterDetector(QObject):
         # baseline only ever raises this, never lowers it.
         if not self._frame_base.is_ready:
             return FREEZE_FLOOR_MS
-        return max(FREEZE_FLOOR_MS, self._frame_base.mean + FREEZE_MARGIN_MS)
+        return max(FREEZE_FLOOR_MS, self._frame_base.mean + FREEZE_MARGIN_MS * self._severe_sensitivity)
 
     def _display_threshold(self) -> float:
         """
@@ -254,9 +297,9 @@ class FrameStutterDetector(QObject):
             # count on the display side.
             return float("inf")
         return max(
-            base.mean * DISPLAY_FLOOR_RATIO,
-            base.mean + DISPLAY_MARGIN_MS,
-            base.mean + DISPLAY_SIGMAS * base.std,
+            base.mean * (1.0 + (DISPLAY_FLOOR_RATIO - 1.0) * self._severe_sensitivity),
+            base.mean + DISPLAY_MARGIN_MS * self._severe_sensitivity,
+            base.mean + DISPLAY_SIGMAS * self._severe_sensitivity * base.std,
         )
 
     @staticmethod
@@ -314,6 +357,11 @@ class FrameStutterDetector(QObject):
             self._last_display_stall_level = display_level
             return True, "DISPLAY_STALL"
 
+        collapse_level = self._pacing_collapse_level(sample)
+        if collapse_level > 0:
+            self._last_pacing_level = collapse_level
+            return True, "FRAME_PACING_COLLAPSE"
+
         spike_threshold = self._spike_threshold()
         if len(self._recent_frames) < MIN_WINDOW_SAMPLES:
             return frame_ms >= spike_threshold, "FRAME_SPIKE"
@@ -349,9 +397,20 @@ class FrameStutterDetector(QObject):
         self._episode_frames = 0
         self._display_stall_minor_count = 0
         self._display_stall_major_count = 0
+        self._pacing_collapse_minor_count = 0
+        self._pacing_collapse_major_count = 0
+        self._peak_pacing_avg_ratio = 0.0
+        self._peak_pacing_p95_ratio = 0.0
+        self._peak_pacing_slow_ratio = 0.0
+        self._lowest_pacing_fps_ratio = 1.0
         self._peak_kind = "FRAME_SPIKE"
         self._calm_ms = 0.0
         self._last_display_stall_level = 0
+        self._last_pacing_level = 0
+        self._last_pacing_avg_ratio = 0.0
+        self._last_pacing_p95_ratio = 0.0
+        self._last_pacing_slow_ratio = 0.0
+        self._last_pacing_fps_ratio = 1.0
         self._metrics_version = getattr(self, "_metrics_version", "v2")
 
     def _finish_episode(self, ended_at: datetime):
@@ -404,6 +463,12 @@ class FrameStutterDetector(QObject):
             display_stall_minor_count=self._display_stall_minor_count,
             display_stall_major_count=self._display_stall_major_count,
             peak_display_excess_ms=self._peak_display_excess,
+            pacing_collapse_minor_count=self._pacing_collapse_minor_count,
+            pacing_collapse_major_count=self._pacing_collapse_major_count,
+            peak_pacing_avg_ratio=self._peak_pacing_avg_ratio,
+            peak_pacing_p95_ratio=self._peak_pacing_p95_ratio,
+            peak_pacing_slow_ratio=self._peak_pacing_slow_ratio,
+            lowest_pacing_fps_ratio=self._lowest_pacing_fps_ratio,
             attribution=attribution,
         )
 
@@ -424,6 +489,17 @@ class FrameStutterDetector(QObject):
             severity = min(1.0, max(self._peak_frame_time / 200.0, p95_frame / 80.0))
         if self._dropped_frames and self._episode_frames:
             severity = max(severity, min(1.0, self._dropped_frames / self._episode_frames))
+        if self._pacing_collapse_major_count:
+            severity = max(
+                severity,
+                min(
+                    1.0,
+                    max(
+                        (self._peak_pacing_avg_ratio - 1.0) / 3.0,
+                        1.0 - self._lowest_pacing_fps_ratio,
+                    ),
+                ),
+            )
         return round(max(0.05, severity), 3)
 
     def _attribute(self):
@@ -468,6 +544,11 @@ class FrameStutterDetector(QObject):
         """
         if self._peak_frame_time >= self._freeze_threshold():
             headline = "A visible freeze occurred."
+        elif self._peak_kind == "FRAME_PACING_COLLAPSE":
+            fps_pct = max(1.0, self._lowest_pacing_fps_ratio * 100.0)
+            headline = (
+                f"Frame pacing briefly collapsed and effective throughput dropped to about {fps_pct:.0f}% of normal."
+            )
         elif self._dropped_frames:
             headline = "Frames were submitted but never reached the screen."
         else:
@@ -501,9 +582,10 @@ class FrameStutterDetector(QObject):
         return {
             "FRAME_SPIKE": 1,
             "DISPLAY_STALL": 2,
-            "FRAME_STUTTER": 3,
-            "FRAME_DROP": 4,
-            "FRAME_FREEZE": 5,
+            "FRAME_PACING_COLLAPSE": 3,
+            "FRAME_STUTTER": 4,
+            "FRAME_DROP": 5,
+            "FRAME_FREEZE": 6,
         }.get(kind, 0)
 
     def _display_excess(self, sample: FrameSample) -> float:
@@ -523,8 +605,8 @@ class FrameStutterDetector(QObject):
         if display_excess <= 0.0:
             return False
         return sample.displayed_time_ms >= threshold and (
-            sample.displayed_time_ms >= sample.frame_time_ms * DISPLAY_LAG_RATIO
-            or display_excess >= DISPLAY_LAG_FLOOR_MS
+            sample.displayed_time_ms >= sample.frame_time_ms * (1.0 + (DISPLAY_LAG_RATIO - 1.0) * self._severe_sensitivity)
+            or display_excess >= DISPLAY_LAG_FLOOR_MS * self._severe_sensitivity
         )
 
     def _is_major_display_anomaly(self, sample: FrameSample) -> bool:
@@ -533,8 +615,11 @@ class FrameStutterDetector(QObject):
         threshold = self._display_threshold()
         display_excess = self._display_excess(sample)
         return (
-            sample.displayed_time_ms >= max(threshold * 1.25, sample.frame_time_ms * DISPLAY_MAJOR_RATIO)
-            or display_excess >= max(DISPLAY_MAJOR_EXCESS_MS, self._display_base.mean * 0.75)
+            sample.displayed_time_ms >= max(
+                threshold * (1.0 + 0.25 * self._severe_sensitivity),
+                sample.frame_time_ms * (1.0 + (DISPLAY_MAJOR_RATIO - 1.0) * self._severe_sensitivity),
+            )
+            or display_excess >= max(DISPLAY_MAJOR_EXCESS_MS * self._severe_sensitivity, self._display_base.mean * 0.75)
         )
 
     def _display_stall_level(self, sample: FrameSample) -> int:
@@ -543,12 +628,15 @@ class FrameStutterDetector(QObject):
         threshold = self._display_threshold()
         display_excess = self._display_excess(sample)
         direct_major = (
-            sample.displayed_time_ms >= max(threshold * 1.5, sample.frame_time_ms * DISPLAY_DIRECT_RATIO)
-            or display_excess >= max(DISPLAY_DIRECT_EXCESS_MS, self._display_base.mean * 1.1)
+            sample.displayed_time_ms >= max(
+                threshold * (1.0 + 0.5 * self._severe_sensitivity),
+                sample.frame_time_ms * (1.0 + (DISPLAY_DIRECT_RATIO - 1.0) * self._severe_sensitivity),
+            )
+            or display_excess >= max(DISPLAY_DIRECT_EXCESS_MS * self._severe_sensitivity, self._display_base.mean * 1.1)
         )
         if (
-            sample.displayed_time_ms >= DISPLAY_FREEZE_GAP_MS
-            or display_excess >= DISPLAY_FREEZE_EXCESS_MS
+            sample.displayed_time_ms >= DISPLAY_FREEZE_GAP_MS * self._severe_sensitivity
+            or display_excess >= DISPLAY_FREEZE_EXCESS_MS * self._severe_sensitivity
         ):
             return 2
         if direct_major:
@@ -565,5 +653,79 @@ class FrameStutterDetector(QObject):
         if self._is_major_display_anomaly(sample) and major_hits >= DISPLAY_MINOR_CLUSTER_COUNT:
             return 2
         if minor_hits >= DISPLAY_MINOR_CLUSTER_COUNT:
+            return 1
+        return 0
+
+    def _recent_frames_within(self, sample: FrameSample, seconds: float) -> list[FrameSample]:
+        cutoff = sample.timestamp - timedelta(seconds=seconds)
+        recent: list[FrameSample] = []
+        for frame in reversed(self._recent_frames):
+            if frame.timestamp < cutoff:
+                break
+            recent.append(frame)
+        recent.reverse()
+        return recent
+
+    def _window_stats(self, frames: list[FrameSample]) -> tuple[float, float, float, float]:
+        if not frames or not self._frame_base.is_ready or self._frame_base.mean <= 0.0:
+            return 0.0, 0.0, 0.0, 1.0
+        frame_times = sorted(frame.frame_time_ms for frame in frames)
+        avg_frame = sum(frame_times) / len(frame_times)
+        p95_idx = min(len(frame_times) - 1, max(0, int(len(frame_times) * 0.95) - 1))
+        p95_frame = frame_times[p95_idx]
+        sensitivity = self._continuous_sensitivity
+        slow_line = max(
+            self._frame_base.mean * (1.25 + 0.35 * sensitivity),
+            self._frame_base.mean + 5.0 * sensitivity,
+        )
+        slow_ratio = sum(1 for frame in frames if frame.frame_time_ms >= slow_line) / len(frames)
+        fps_ratio = min(1.0, self._frame_base.mean / max(avg_frame, 0.1))
+        return (
+            avg_frame / self._frame_base.mean,
+            p95_frame / self._frame_base.mean,
+            slow_ratio,
+            fps_ratio,
+        )
+
+    def _pacing_collapse_level(self, sample: FrameSample) -> int:
+        if not self._frame_base.is_ready or self._frame_base.mean <= 0.0:
+            return 0
+        short_frames = self._recent_frames_within(sample, PACING_SHORT_WINDOW_S)
+        long_frames = self._recent_frames_within(sample, PACING_LONG_WINDOW_S)
+        if len(short_frames) < PACING_MIN_SHORT_FRAMES or len(long_frames) < PACING_MIN_LONG_FRAMES:
+            return 0
+
+        short_avg_ratio, short_p95_ratio, short_slow_ratio, short_fps_ratio = self._window_stats(short_frames)
+        long_avg_ratio, long_p95_ratio, long_slow_ratio, long_fps_ratio = self._window_stats(long_frames)
+        sensitivity = self._continuous_sensitivity
+        major_avg_ratio = 2.55 * sensitivity
+        major_p95_ratio = 3.5 * sensitivity
+        major_slow_ratio = min(0.8, 0.55 * max(0.8, sensitivity))
+        major_fps_ratio = min(0.75, 0.42 / max(0.7, sensitivity))
+        minor_avg_ratio = 1.9 * sensitivity
+        minor_p95_ratio = 2.6 * sensitivity
+        minor_slow_ratio = min(0.75, 0.42 * max(0.8, sensitivity))
+        minor_fps_ratio = min(0.85, 0.58 / max(0.7, sensitivity))
+
+        self._last_pacing_avg_ratio = max(short_avg_ratio, long_avg_ratio)
+        self._last_pacing_p95_ratio = max(short_p95_ratio, long_p95_ratio)
+        self._last_pacing_slow_ratio = max(short_slow_ratio, long_slow_ratio)
+        self._last_pacing_fps_ratio = min(short_fps_ratio, long_fps_ratio)
+
+        major = (
+            (short_avg_ratio >= major_avg_ratio and short_slow_ratio >= major_slow_ratio)
+            or (long_avg_ratio >= major_avg_ratio and long_slow_ratio >= major_slow_ratio)
+            or (long_p95_ratio >= major_p95_ratio and long_fps_ratio <= major_fps_ratio)
+        )
+        if major:
+            return 2
+
+        minor = (
+            (short_avg_ratio >= minor_avg_ratio and short_slow_ratio >= minor_slow_ratio)
+            or (short_p95_ratio >= minor_p95_ratio and short_fps_ratio <= minor_fps_ratio)
+            or (long_avg_ratio >= minor_avg_ratio and long_slow_ratio >= minor_slow_ratio)
+            or (long_p95_ratio >= minor_p95_ratio and long_fps_ratio <= minor_fps_ratio)
+        )
+        if minor:
             return 1
         return 0

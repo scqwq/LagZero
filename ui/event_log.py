@@ -43,6 +43,7 @@ CAUSE_COLOURS = {
     "BACKGROUND_INTERFERENCE": AMBER,
     "SYSTEM_RAM_PRESSURE":  RED,
     "GAME_MEMORY_LIMIT":    "#9b59b6",
+    "FRAME_PACING_COLLAPSE": "#e67e22",
     "LOCAL_STUTTER":        AMBER,
     "UNDETERMINED":         MUTED,
     "REPORT_PENDING":       ACCENT,
@@ -414,7 +415,7 @@ class EventLogWidget(QWidget):
             # the category so old records still land in the correct tab.
             if event.category in ("RESOURCE_PRESSURE_RISK", "CPU Pressure Stall", "I/O Pressure Stall"):
                 source = "pressure"
-            elif event.category in {"FRAME_SPIKE", "CPU_STAGE_STALL", "TRANSIENT_DISTURBANCE", "LOCAL_STUTTER", "UNDETERMINED"}:
+            elif event.category in {"FRAME_SPIKE", "FRAME_PACING_COLLAPSE", "CPU_STAGE_STALL", "TRANSIENT_DISTURBANCE", "LOCAL_STUTTER", "UNDETERMINED"}:
                 source = "minor"
             else:
                 source = "frame"
