@@ -162,7 +162,7 @@ class EventRow(QFrame):
             self._dur_label.setText("资源压力提示")
         else:
             self._dur_label.setText(f"{dur}s duration")
-        code = self._lag_event.category or self._lag_event.cause_code or "UNKNOWN"
+        code = self._lag_event.cause_code or self._lag_event.category or "UNKNOWN"
         badge_colour = CAUSE_COLOURS.get(code, MUTED)
         self._badge.setText(code.replace("_", " "))
         self._badge.setStyleSheet(f"""

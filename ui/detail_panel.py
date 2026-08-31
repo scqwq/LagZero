@@ -197,19 +197,27 @@ class DetailPanelWidget(QWidget):
     def show_event(self, event: LagEvent, snapshot: LagSnapshot | None):
         self._current_event = event
         self._current_snapshot = snapshot
-        code = event.category or event.cause_code or "UNKNOWN"
+        det_code = event.cause_code or event.category or "UNKNOWN"
+        attr_code = event.category or ""
+        code = attr_code or det_code
         colour = CAUSE_COLOURS.get(code, MUTED)
         icon = CAUSE_ICONS.get(code, "❓")
-        title = self._cause_label(code)
+        title = self._cause_label(det_code)
+        attr_label = self._cause_label(attr_code) if attr_code and attr_code != det_code else ""
         scope = self._scope_label(event.scope)
         if event.is_pending:
             duration = "Generating..." if self._report_language == "en" else "正在生成报告"
         else:
             duration = f"{round(event.duration_seconds, 1)}s"
 
+        title_line = f'<div style="color:{colour};font-size:15px;font-weight:700;">{icon} {title}'
+        if attr_label:
+            title_line += f' <span style="color:{MUTED};font-size:12px;font-weight:400;">· {attr_label}</span>'
+        title_line += '</div>'
+
         html = [
             f'<div style="background:{BG2};border-left:3px solid {colour};border-radius:6px;padding:14px 16px;">',
-            f'<div style="color:{colour};font-size:15px;font-weight:700;">{icon} {title}</div>',
+            title_line,
             f'<div style="color:{MUTED};font-size:12px;margin-top:6px;">{event.started_at.strftime("%A, %b %d at %H:%M:%S")} · {duration} · {scope}</div>',
             f'<div style="color:{TEXT};font-size:13px;margin-top:10px;line-height:1.45;">{self._escape(self._explanation_text(event, snapshot))}</div>',
             "</div>",

@@ -1754,7 +1754,7 @@ class MainWindow(QMainWindow):
             if resource_context:
                 event.cause = f"{event.cause}\n\n{resource_context}"
         event.category = verdict.category
-        event.cause_code = verdict.category
+        event.cause_code = episode.event_type
         event.scope = verdict.scope
         event.frame_summary = verdict.frame_summary
         event.detection_source = self._resolve_detection_source(
