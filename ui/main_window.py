@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import QStyle
 
+from core.paths import DATA_DIR
 from core.models import (
     SystemSample, LagScore, LagEvent, LagSnapshot,
     CompatibilityMetricsSnapshot, GameSessionInfo, GameWindowCandidate, FrameMetricsSnapshot, FrameStutterEpisode,
@@ -231,7 +232,7 @@ def _write_spinbox_arrow(path: Path, points: tuple[QPointF, QPointF, QPointF]) -
 
 def _spinbox_arrow_stylesheet() -> str:
     """Create arrow images for QSS; native arrows vanish once QSS owns buttons."""
-    directory = Path(__file__).resolve().parent.parent / "data"
+    directory = DATA_DIR
     directory.mkdir(parents=True, exist_ok=True)
 
     up_path = directory / "spinbox_up.png"
@@ -374,9 +375,7 @@ class MainWindow(QMainWindow):
         self._display_pipeline_report_gate = ExponentialBackoffGate(DISPLAY_PIPELINE_ALERT_INTERVALS_S)
         self._last_pressure_findings = []
 
-        self.setWindowTitle("LagLense")
-
-        self.setWindowTitle("LagLense")
+        self.setWindowTitle("LagZero")
         self.resize(1100, 720)
         self.setMinimumSize(800, 550)
         self._apply_dark_theme()
@@ -411,7 +410,7 @@ class MainWindow(QMainWindow):
 
         # --- Header ---
         header = QHBoxLayout()
-        title = QLabel("LagLense")
+        title = QLabel("LagZero")
         title.setStyleSheet(f"color: {TEXT}; font-size: 20px; font-weight: 800;")
         self._status_dot = StatusDot()
         self._baseline_label = QLabel("基线：学习中…")
@@ -1404,7 +1403,7 @@ class MainWindow(QMainWindow):
         if report.needs_elevation:
             return (
                 f"发现 {report.found} 个残留会话，但停止被拒绝（需要管理员权限）。"
-                "请以管理员身份重启 LagLense 后再试。"
+                "请以管理员身份重启 LagZero 后再试。"
             )
         return (
             f"已清理 {report.stopped}/{report.found} 个残留会话，"
@@ -2280,7 +2279,7 @@ class MainWindow(QMainWindow):
         event.ignore()
         self.hide()
         self._tray.showMessage(
-            "System Lag Detective",
+            "LagZero",
             "Still running in the background.",
             QSystemTrayIcon.MessageIcon.Information,
             2000,

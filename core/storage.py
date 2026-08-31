@@ -21,12 +21,13 @@ from sqlalchemy.orm import DeclarativeBase, Session, relationship
 from sqlalchemy.pool import NullPool
 
 from core.models import LagEvent, LagSnapshot
+from core.paths import DATA_DIR
 
 # ---------------------------------------------------------------------------
 # Database path
 # ---------------------------------------------------------------------------
 
-DB_PATH = Path(__file__).parent.parent / "data" / "lag_history.db"
+DB_PATH = DATA_DIR / "lag_history.db"
 MINOR_INTERFERENCE_CATEGORIES = (
     "FRAME_SPIKE",
     "FRAME_PACING_COLLAPSE",

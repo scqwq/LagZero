@@ -472,7 +472,7 @@ class PresentMonBridge(QObject):
         previous session instead of leaving it running as an orphan. The PID
         keeps concurrent LagLense instances from fighting over one name.
         """
-        return f"LagLense-{os.getpid()}"
+        return f"LagZero-{os.getpid()}"
 
     def target_description(self) -> str:
         if self._target_pid:
@@ -629,7 +629,7 @@ class PresentMonBridge(QObject):
             self._probe_pause_requested.emit(pause_done)
             pause_done.wait(3.0)
         self.cleanup_stale_sessions(include_active=False)
-        session_name = f"LagLenseProbe-{os.getpid()}"
+        session_name = f"LagZeroProbe-{os.getpid()}"
         with tempfile.NamedTemporaryFile(prefix="laglense_probe_", suffix=".csv", delete=False) as tmp:
             temp_path = Path(tmp.name)
 
@@ -757,7 +757,7 @@ class PresentMonBridge(QObject):
             if "access denied" in lowered:
                 self._last_failure_reason = "access denied"
                 self.error_occurred.emit(
-                    "PresentMon failed with ACCESS DENIED. Please restart LagLense as Administrator."
+                    "PresentMon failed with ACCESS DENIED. Please restart LagZero as Administrator."
                 )
             if "1450" in lowered:
                 self._last_failure_reason = "trace session error 1450"
@@ -1093,7 +1093,7 @@ class PresentMonBridge(QObject):
             # "LagLense" without the dash also catches "LagLenseProbe-<pid>": the
             # probe cleans up after itself, but if that cleanup was denied the
             # orphan would otherwise never be reclaimed by anything.
-            if not (name.startswith("LagLense") or name == "PresentMon"):
+            if not (name.startswith(("LagZero", "LagLense")) or name == "PresentMon"):
                 continue
             if not include_active and name.lower() == current:
                 continue

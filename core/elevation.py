@@ -135,13 +135,13 @@ def relaunch_as_admin() -> tuple[bool, str]:
         return False, f"Elevation failed: {exc}"
 
     if result > _SHELL_EXECUTE_MIN_SUCCESS:
-        return True, "Restarting LagLense with administrator privileges…"
+        return True, "Restarting LagZero with administrator privileges…"
 
     os.environ.pop(_ELEVATION_ATTEMPT_ENV, None)
     if result == _ERROR_CANCELLED:
         return False, (
             "Administrator access was declined. High-precision capture needs "
-            "elevation; LagLense will continue in compatibility mode."
+            "elevation; LagZero will continue in compatibility mode."
         )
     return False, f"Elevation failed (ShellExecuteW returned {result})."
 

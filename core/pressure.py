@@ -4,14 +4,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 import math
-from pathlib import Path
 from time import monotonic
 
 from core.collectors import BROWSER_PROCESS_GROUPS, per_core_to_machine_share
 from core.models import FrameStutterEpisode, ProcessSample, SystemSample
+from core.paths import DATA_DIR
 
 
-SETTINGS_PATH = Path(__file__).parent.parent / "data" / "pressure_settings.json"
+SETTINGS_PATH = DATA_DIR / "pressure_settings.json"
 
 
 @dataclass

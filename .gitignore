@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 *.spec
+!LagZero.spec
 
 # Virtual environment
 venv/

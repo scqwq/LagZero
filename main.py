@@ -52,7 +52,7 @@ def main():
     )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("System Lag Detective")
+    app.setApplicationName("LagZero")
     app.setApplicationVersion("1.0.0")
     app.setQuitOnLastWindowClosed(False)  # Keep running in tray
 
