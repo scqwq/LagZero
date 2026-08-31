@@ -144,5 +144,5 @@ Ctrl + C 或者关掉控制台即可
 本项目以 `LagLense` 为原始框架，在此基础上继续调整检测策略、分类结构与报告文案，形成当前的 `LagZero`。
 
 - 原项目名称：`LagLense`
-- 原项目地址：`（待补充）`
+- 原项目地址：`https://github.com/demonz69/LagLense`
 - 本项目名称：`LagZero`
