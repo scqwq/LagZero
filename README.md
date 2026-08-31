@@ -1,124 +1,140 @@
-# LagLens v1.0
+# LagZero
 
-> **See exactly why your PC lagged — with forensic context captured before the spike hit.**
+基于 `LagLense` 框架制作的 Windows 游戏卡顿检测工具，用来在你玩游戏时持续记录帧时间、系统资源和窗口状态，并在出现异常时给出更接近“人能看懂”的报告。
 
-LagLens is a Windows desktop tool that monitors your system in real time and automatically diagnoses PC lag. Unlike Task Manager, which only shows you what's happening *right now*, LagLens captures the **5 seconds before** a lag event fires and tells you in plain English what caused it.
+## 项目作用
 
----
+`LagZero` 的核心目标不是只告诉你“电脑刚刚卡了”，而是尽量回答下面几件事：
 
-## For Windows Users (No Python Needed)
+- 卡顿到底有没有真实发生。
+- 这是明显卡顿、轻微波动，还是只是系统压力升高。
+- 更像是 CPU、GPU、内存、上屏链路、后台进程还是 IO 在作怪。
+- 卡顿发生前后，系统大概处在什么状态。
 
-**Download `LagLens.exe` from the [Releases](../../releases) page and run it. That's it.**
+程序会把结果整理成 3 个同等级类别：
 
-- No installation required
-- No Python required
-- Double-click and it starts monitoring immediately
-- Minimises to the system tray when closed
+- `卡顿报告`：已经确认有比较明显的帧级异常，优先放真正值得关注的卡顿。
+- `轻微干扰`：有波动或短时异常，但严重性较低，适合做“偶发提醒”而不是重警告。
+- `系统压力`：资源压力明显，但不一定已经形成强烈的玩家可感知卡顿。
 
----
+## 环境需求
 
-## For Linux / macOS Users (From Source)
+- `Windows` 系统。
+- `Python 3.10+`。
+- 需要管理员权限运行；程序会通过 `core/elevation.py` 自动尝试 UAC 提权重启。
+- 依赖 `Intel PresentMon 2.5.1`。项目已按当前目录结构接入 `tools/PresentMon/PresentMon-2.5.1-x64.exe`。
+- UI 使用 `PySide6 / Qt`，系统采样使用 `psutil`，本地历史记录使用 `SQLite + SQLAlchemy`。
+
+源码运行示例：
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/laglens.git
-cd laglens
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
 python main.py
 ```
 
-**Requirements:** Python 3.10+
+## 面板如何使用
 
----
+主界面可以简单理解为“上方看实时状态，左侧看事件列表，右侧看详细报告，设置页调阈值”。
 
-## What It Does
+### 1. 顶部状态与实时指标
 
-### Live Dashboard
-| Metric | What it measures |
-|---|---|
-| CPU % | Overall processor usage |
-| RAM % | Memory used vs total, swap pressure |
-| Responsiveness | How long a trivial OS operation takes (ms) — catches disk-bound lag that CPU% misses |
-| Lag Score | Composite 0–100% health indicator |
+- `监控中 / 负载升高 / 检测到卡顿 / 正在学习基线`：当前监控状态。
+- `CPU`：整机 CPU 占用。
+- `RAM`：整机内存占用。
+- `RESP` 或响应性：系统对轻量操作的响应延迟，适合辅助判断 IO、分页或系统卡死感。
+- `压力：正常 / 抬升 / 活跃 / 恢复中`：资源压力调度器当前状态。
 
-Status dot colour: 🟢 OK → 🟡 Elevated → 🔴 Lag detected
+### 2. 左侧事件列表
 
-### Smart Detection
-- Learns *your* machine's normal behaviour in ~60 seconds (gaming PC ≠ office laptop)
-- Requires 2 consecutive bad seconds before firing — single blips are ignored
-- Keeps a rolling 5-second pre-lag buffer so it looks *backward* when lag fires
+左上方可以切换 3 个筛选栏：
 
-### Cause Diagnosis
-Every confirmed lag event gets a plain-English explanation:
+- `卡顿报告`：看明显卡顿。
+- `轻微干扰`：看短暂抖动、轻度波动、弱证据异常。
+- `系统压力`：看资源风险和压力类提示。
 
-| Cause | Example output |
-|---|---|
-| CPU Spike | *"chrome.exe (PID 4821) was consuming 78% CPU, causing the system to become unresponsive."* |
-| RAM Exhaustion | *"System RAM is critically full (14.2 GB / 16 GB). The OS is writing memory to disk (paging)."* |
-| Background Cluster | *"6 background processes are each consuming CPU, totalling ~52% combined."* |
-| Disk I/O | *"CPU was normal (18%) but responsiveness was 210ms. Likely a disk bottleneck — antivirus, updates, or backup."* |
-| Scheduler Contention | *"System under general stress — no single clear cause identified."* |
+点击任意事件后，右侧会显示详情。删除按钮只删除当前这条事件；`清空全部` 只清当前筛选类别的数据。
 
-### Event History
-- Every lag event saved to a local SQLite database — history survives restarts
-- Click any past event to see: cause card, peak metrics, pre-lag sparkline timeline, top processes table
+### 3. 右侧详情面板
 
----
+右侧报告一般会显示这些内容：
 
-## Building the .exe Yourself (Windows)
+- 标题：事件类型和大致严重性。
+- `主判断`：目前更像是哪一段出了问题。
+- `伴随线索`：当时检测到的关键证据。
+- `优先建议`：优先从哪里排查。
+- `峰值指标`：CPU、RAM、响应延迟、综合分数。
+- `游戏原始指标`：目标进程、显存预算、读写吞吐、线程数等。
+- `卡顿前时间线`：最近 5 秒的 CPU / RAM / 响应变化。
+- `峰值时刻主要进程`：帮助看是不是后台程序在抢资源。
 
-If you want to build `LagLens.exe` from source:
+### 4. 设置页参数说明
 
-```bat
-git clone https://github.com/YOUR_USERNAME/laglens.git
-cd laglens
-build_windows.bat
-```
+- `报告语言`：切换 `报告：中文` 和 `Report: English`，只影响报告显示文本，不影响检测逻辑。
+- `明显卡顿灵敏度`：控制明显卡顿、严重上屏异常等强事件的触发门槛。越小越敏感，越大越保守。
+- `连续波动灵敏度`：控制短时连续掉速、轻微波动聚类这类事件的触发门槛。越小越容易报，越大越不容易报。
+- `帧时间尖峰倍率`：单帧轻度异常相对基线放大的倍数阈值。
+- `帧时间卡顿倍率`：单帧明显卡顿相对基线放大的倍数阈值。
+- `允许前台高占用`：前台程序本身高占用时，是否适当放宽部分资源压力判断。
+- 其他 CPU / RAM 阈值项：控制系统压力、前台进程压力、后台进程压力的告警线。
+- `保存设置`：立即把当前设置写入 `data/pressure_settings.json`。
+- `恢复默认阈值`：回到按本机 CPU 线程数和总内存推导出来的默认值。
 
-The script installs all dependencies and runs PyInstaller automatically.
-Output: `dist\LagLens.exe` — a single portable file.
+## 三类报告分别在说什么
 
----
+- `卡顿报告`：告诉你“这次卡顿确实比较明显，而且值得认真看原因”。
+- `轻微干扰`：告诉你“这次有异常，但更像短暂波动或偶发干扰，不一定需要立刻处理”。
+- `系统压力`：告诉你“资源已经偏紧，即使现在没爆成重卡顿，也可能正在逼近问题”。
 
-## Architecture
+## 卡顿报告的种类
 
-```
-main.py                 Entry point — wires all components
-core/
-  models.py             Data structures (SystemSample, LagEvent, LagSnapshot)
-  collectors.py         Background thread: CPU, RAM, processes, responsiveness probe
-  detection.py          Sigmoid scoring, rolling window, baseline learning, state machine
-  analyzer.py           5-rule cause engine → plain-English explanations
-  recorder.py           5-second pre-lag rolling buffer + snapshot capture
-  storage.py            SQLite persistence via SQLAlchemy
-ui/
-  main_window.py        Live metrics bar, status dot, tray icon, signal wiring
-  event_log.py          Scrollable event list with severity colour + cause badges
-  detail_panel.py       Cause card, peak chips, sparkline timeline, process table
-```
+下面这些更偏“玩家能明显感受到”的异常，会优先进入 `卡顿报告`：
 
----
+- `FRAME_STUTTER`：单帧或短段帧时间明显变慢，属于常见的“突然一卡”。
+- `FRAME_FREEZE`：单帧或短段卡得很重，接近明显冻结。
+- `FRAME_DROP`：有帧根本没有正常上屏，更像画面直接丢帧。
+- `DISPLAY_STALL`：画面显示到屏幕这一步明显拖长了。
+- `DISPLAY_PIPELINE`：帧可能已经做出来，但上屏链路异常，常见于显示链路、覆盖层、切窗口、合成器等干扰。
+- `GPU_BOUND`：更像显卡渲染阶段太重。
+- `DRIVER_RENDER_PATH`：更像驱动、Present、渲染提交路径这段卡住了。
+- `CPU_BOUND`：整机 CPU 压力已经很高，游戏抢不到足够计算时间。
+- `SCHEDULER_CONTENTION`：游戏线程在和后台程序抢 CPU 时间片。
+- `Window Not Responding`：窗口主线程已经接近挂起或确实未响应。
+- `Visual Freeze`：兼容模式下检测到画面长时间不变化。
+- `Responsiveness Stall`：窗口响应延迟明显升高。
 
-## Tests
+## 轻微干扰的种类
 
-```bash
-python tests/test_detection.py
-# 16 tests — detection engine, cause analyzer, sigmoid math, false-positive prevention
-```
+下面这些更偏“短时波动、偶发抖动、证据不够强”，会进入 `轻微干扰`：
 
----
+- `FRAME_SPIKE`：单帧出现尖峰，但还没到严重卡顿级别。
+- `FRAME_PACING_COLLAPSE`：不是一帧特别长，而是短时间内连续很多帧一起变差。
+- `CPU_STAGE_STALL`：更像游戏内部某个 CPU 阶段突然变慢，但整机 CPU 未必吃满。
+- `TRANSIENT_DISTURBANCE`：更像一次瞬时干扰，例如焦点变化、切窗口、短暂系统打扰。
+- `LOCAL_STUTTER`：确认有本地波动，但证据还不足以明确锁定根因。
+- `UNDETERMINED`：检测到异常，但暂时还无法稳定归因。
+- `轻度 DISPLAY_PIPELINE`：轻度上屏抖动、偶发上屏延迟，程序会尽量放在这里而不是频繁抬到重卡顿。
 
-## Roadmap
+## 系统压力常见类型
 
-- [ ] Disk I/O collector (`psutil.disk_io_counters`)
-- [ ] Network spike detection  
-- [ ] Export history to CSV
-- [ ] ML-based classifier (Decision Tree trained on your collected events)
-- [ ] Settings panel (custom thresholds, interval)
+`系统压力` 主要用于提醒资源环境，而不是直接断言“玩家一定感受到了重卡顿”：
 
----
+- `RESOURCE_PRESSURE_RISK`：综合资源压力偏高。
+- `SYSTEM_RAM_PRESSURE`：系统可用内存偏少，可能已经分页。
+- `VRAM_PRESSURE`：显存预算接近上限。
+- `GAME_MEMORY_LIMIT`：游戏进程自己的内存空间正在变紧。
+- `BACKGROUND_INTERFERENCE`：后台程序整体干扰较强。
+- `IO_STALL`：更像磁盘或 IO 路径正在拖慢系统。
+- `CPU Pressure Stall`：兼容模式下的 CPU 压力路径提示。
+- `I/O Pressure Stall`：兼容模式下的 IO 压力路径提示。
 
-## 📄 License
+## 模式说明
 
-MIT — see [LICENSE](LICENSE)
+- `高精度模式`：优先使用 PresentMon 逐帧采样，可以看到帧时间、CPU/GPU busy/wait、上屏时间、丢帧等，更适合真正做帧级诊断。
+- `兼容模式`：当高精度采集不可用时启用，主要看窗口响应、视觉冻结、进程 CPU/内存/IO 等，精度低于高精度模式，但兼容性更强。
+
+## 原作引用
+
+本项目以 `LagLense` 为原始框架，在此基础上继续调整检测策略、分类结构与报告文案，形成当前的 `LagZero`。
+
+- 原项目名称：`LagLense`
+- 原项目地址：`（待补充）`
+- 本项目名称：`LagZero`
