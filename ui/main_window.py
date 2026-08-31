@@ -76,6 +76,7 @@ STUTTER_ALERT_INTERVALS_S = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 MANUAL_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 AUTO_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 STUTTER_REPORT_SOURCES = {"frame", "compat"}
+MINOR_REPORT_SOURCES = {"minor"}
 PRESSURE_REPORT_SOURCES = {"pressure", "system", "compat_pressure"}
 PRESSURE_ONLY_CATEGORIES = {
     "RESOURCE_PRESSURE_RISK",
@@ -88,6 +89,13 @@ PRESSURE_ONLY_CATEGORIES = {
     "BACKGROUND_CLUSTER",
     "IO_STALL",
     "DISK_IO",
+}
+MINOR_INTERFERENCE_CATEGORIES = {
+    "FRAME_SPIKE",
+    "CPU_STAGE_STALL",
+    "TRANSIENT_DISTURBANCE",
+    "LOCAL_STUTTER",
+    "UNDETERMINED",
 }
 
 EVENT_LABELS = {
@@ -262,7 +270,7 @@ class MainWindow(QMainWindow):
     # SQLAlchemy on the GUI thread.
     event_persisted = Signal(object, int, object, int)
     event_count_loaded = Signal(int)
-    history_loaded = Signal(list)
+    history_loaded = Signal(object)
 
     def __init__(
         self,
@@ -837,9 +845,13 @@ class MainWindow(QMainWindow):
                 return "compat_pressure"
             if self._is_pressure_only_category(normalized):
                 return "pressure"
+            if normalized in MINOR_INTERFERENCE_CATEGORIES:
+                return "minor"
             return "compat"
         if self._is_pressure_only_category(normalized):
             return "pressure"
+        if normalized in MINOR_INTERFERENCE_CATEGORIES:
+            return "minor"
         return "frame"
 
     def _report_gate_for_source(self, source: str) -> ExponentialBackoffGate:
@@ -852,6 +864,8 @@ class MainWindow(QMainWindow):
         category = event.category or event.cause_code or "UNKNOWN"
         if source in STUTTER_REPORT_SOURCES:
             return f"stutter:{category}"
+        if source in MINOR_REPORT_SOURCES:
+            return f"minor:{category}"
         if findings:
             family = self._pressure_family_from_codes([getattr(finding, "code", "") for finding in findings])
             return f"pressure:{family}"
@@ -973,7 +987,7 @@ class MainWindow(QMainWindow):
             episode=None,
             fallback_source="system",
         )
-        bucket = "系统压力" if event.detection_source in PRESSURE_REPORT_SOURCES else "卡顿报告"
+        bucket = self._bucket_label_for_source(event.detection_source)
         self._emit_report_event(
             event,
             snapshot,
@@ -1074,14 +1088,14 @@ class MainWindow(QMainWindow):
         self._detail_panel.clear_event()
         event_type = self._event_log.filter_mode
         count = self._storage.event_count(event_type)
-        label = "系统压力" if event_type == "pressure" else "卡顿报告"
+        label = self._filter_label(event_type)
         self._event_count_label.setText(f"{label}：{count} 条")
         self._set_status_message(f"已删除 1 条{label}", force=True)
 
     @Slot(str)
     def _on_clear_all_events_requested(self, filter_mode: str = "stutter"):
         removed = self._storage.delete_all_events(filter_mode)
-        label = "系统压力" if filter_mode == "pressure" else "卡顿报告"
+        label = self._filter_label(filter_mode)
         if removed <= 0:
             self._set_status_message(f"当前没有可清空的{label}", force=True)
             return
@@ -1613,7 +1627,7 @@ class MainWindow(QMainWindow):
             episode=episode,
             fallback_source="frame",
         )
-        bucket = "系统压力" if event.detection_source in PRESSURE_REPORT_SOURCES else "卡顿报告"
+        bucket = self._bucket_label_for_source(event.detection_source)
         timing_label = "峰值响应" if episode.present_mode == "compatibility" else "峰值帧时间"
         self._emit_report_event(
             event,
@@ -1666,10 +1680,26 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    @staticmethod
+    def _filter_label(filter_mode: str) -> str:
+        return {
+            "stutter": "卡顿报告",
+            "minor": "轻微干扰",
+            "pressure": "系统压力",
+        }.get(filter_mode, "卡顿报告")
+
+    @classmethod
+    def _bucket_label_for_source(cls, source: str) -> str:
+        if source in STUTTER_REPORT_SOURCES:
+            return cls._filter_label("stutter")
+        if source in MINOR_REPORT_SOURCES:
+            return cls._filter_label("minor")
+        return cls._filter_label("pressure")
+
     @Slot(int)
     def _on_event_count_loaded(self, count: int):
         self._event_log.set_total_count(count)
-        label = "系统压力" if self._event_log.filter_mode == "pressure" else "卡顿报告"
+        label = self._filter_label(self._event_log.filter_mode)
         self._event_count_label.setText(f"{label}：{count} 条")
 
     @Slot(str)
@@ -1688,7 +1718,6 @@ class MainWindow(QMainWindow):
     def _load_history(self):
         self._history_offset = 0
         self._history_loading = False
-        self._event_log.clear_events()
         event_type = self._event_log.filter_mode
 
         def _worker():
@@ -1696,15 +1725,34 @@ class MainWindow(QMainWindow):
             events = self._storage.get_recent_events(
                 limit=HISTORY_PAGE_SIZE, event_type=event_type
             )
-            self.history_loaded.emit(events)
-            self.event_count_loaded.emit(count)
+            self.history_loaded.emit({
+                "mode": event_type,
+                "events": events,
+                "count": count,
+                "replace": True,
+            })
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    @Slot(list)
-    def _on_history_loaded(self, events: list[LagEvent]):
+    @Slot(object)
+    def _on_history_loaded(self, payload: object):
+        if not isinstance(payload, dict):
+            return
+        mode = str(payload.get("mode") or "")
+        if mode != self._event_log.filter_mode:
+            return
+        events = payload.get("events") or []
+        replace = bool(payload.get("replace"))
+        if replace:
+            count = int(payload.get("count") or 0)
+            self._event_log.replace_events(events, total_count=count)
+            self._history_offset = len(events)
+            self._history_loading = False
+            self._event_count_label.setText(f"{self._filter_label(mode)}：{count} 条")
+            return
         self._event_log.append_history(events)
         self._history_offset += len(events)
+        self._history_loading = False
 
     def _load_more_history(self):
         if self._history_loading:
@@ -1717,7 +1765,11 @@ class MainWindow(QMainWindow):
                 limit=HISTORY_PAGE_SIZE, offset=self._history_offset,
                 event_type=event_type,
             )
-            self.history_loaded.emit(events)
+            self.history_loaded.emit({
+                "mode": event_type,
+                "events": events,
+                "replace": False,
+            })
 
         threading.Thread(target=_worker, daemon=True).start()
 

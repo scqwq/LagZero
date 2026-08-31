@@ -27,6 +27,13 @@ from core.models import LagEvent, LagSnapshot
 # ---------------------------------------------------------------------------
 
 DB_PATH = Path(__file__).parent.parent / "data" / "lag_history.db"
+MINOR_INTERFERENCE_CATEGORIES = (
+    "FRAME_SPIKE",
+    "CPU_STAGE_STALL",
+    "TRANSIENT_DISTURBANCE",
+    "LOCAL_STUTTER",
+    "UNDETERMINED",
+)
 
 
 def _ensure_data_dir():
@@ -149,6 +156,12 @@ class Storage:
                     "UPDATE lag_events SET detection_source = 'frame' "
                     "WHERE detection_source = ''"
                 )
+            minor_list = ", ".join(f"'{category}'" for category in MINOR_INTERFERENCE_CATEGORIES)
+            conn.exec_driver_sql(
+                "UPDATE lag_events SET detection_source = 'minor' "
+                f"WHERE category IN ({minor_list}) "
+                "AND detection_source IN ('', 'frame', 'compat', 'system')"
+            )
             snapshot_existing = {
                 row[1]
                 for row in conn.exec_driver_sql("PRAGMA table_info(lag_snapshots)").fetchall()
@@ -294,6 +307,8 @@ class Storage:
                     LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
                     | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
                 )
+            elif event_type == "minor":
+                stmt = stmt.where(LagEventRow.detection_source == "minor")
             elif event_type == "stutter":
                 stmt = stmt.where(
                     LagEventRow.detection_source.in_(("frame", "compat"))
@@ -330,6 +345,8 @@ class Storage:
                     LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
                     | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
                 )
+            elif event_type == "minor":
+                stmt = stmt.where(LagEventRow.detection_source == "minor")
             elif event_type == "stutter":
                 stmt = stmt.where(
                     LagEventRow.detection_source.in_(("frame", "compat"))
@@ -362,6 +379,8 @@ class Storage:
                     LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
                     | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
                 )
+            elif event_type == "minor":
+                count_stmt = count_stmt.where(LagEventRow.detection_source == "minor")
             elif event_type == "stutter":
                 count_stmt = count_stmt.where(
                     LagEventRow.detection_source.in_(("frame", "compat"))
@@ -376,6 +395,8 @@ class Storage:
                     LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
                     | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
                 )
+            elif event_type == "minor":
+                del_stmt = del_stmt.where(LagEventRow.detection_source == "minor")
             elif event_type == "stutter":
                 del_stmt = del_stmt.where(
                     LagEventRow.detection_source.in_(("frame", "compat"))

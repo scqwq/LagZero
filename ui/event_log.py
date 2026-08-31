@@ -192,7 +192,7 @@ class EventLogWidget(QWidget):
 
     event_selected = Signal(object)   # LagEvent
     event_delete_requested = Signal(object)  # LagEvent
-    clear_all_requested = Signal(str)  # "stutter" or "pressure"
+    clear_all_requested = Signal(str)  # "stutter", "minor", or "pressure"
     more_history_requested = Signal()
     filter_changed = Signal(str)
 
@@ -246,12 +246,17 @@ class EventLogWidget(QWidget):
         self._stutter_filter_btn.setCheckable(True)
         self._stutter_filter_btn.setChecked(True)
         self._stutter_filter_btn.setStyleSheet(filter_style)
+        self._minor_filter_btn = QPushButton("轻微干扰")
+        self._minor_filter_btn.setCheckable(True)
+        self._minor_filter_btn.setStyleSheet(filter_style)
         self._pressure_filter_btn = QPushButton("系统压力")
         self._pressure_filter_btn.setCheckable(True)
         self._pressure_filter_btn.setStyleSheet(filter_style)
         self._filter_group.addButton(self._stutter_filter_btn)
+        self._filter_group.addButton(self._minor_filter_btn)
         self._filter_group.addButton(self._pressure_filter_btn)
         self._stutter_filter_btn.clicked.connect(lambda: self._on_filter_changed("stutter"))
+        self._minor_filter_btn.clicked.connect(lambda: self._on_filter_changed("minor"))
         self._pressure_filter_btn.clicked.connect(lambda: self._on_filter_changed("pressure"))
 
         self._count_label = QLabel("0")
@@ -290,6 +295,7 @@ class EventLogWidget(QWidget):
         )
         header.addWidget(title)
         header.addWidget(self._stutter_filter_btn)
+        header.addWidget(self._minor_filter_btn)
         header.addWidget(self._pressure_filter_btn)
         header.addWidget(self._count_label)
         header.addStretch()
@@ -389,12 +395,12 @@ class EventLogWidget(QWidget):
         self._refresh_state()
 
     def set_filter_mode(self, mode: str):
-        if mode not in {"stutter", "pressure"} or mode == self._filter_mode:
+        if mode not in {"stutter", "minor", "pressure"} or mode == self._filter_mode:
             return
         self._filter_mode = mode
         self._stutter_filter_btn.setChecked(mode == "stutter")
+        self._minor_filter_btn.setChecked(mode == "minor")
         self._pressure_filter_btn.setChecked(mode == "pressure")
-        self.clear_events()
         self.filter_changed.emit(mode)
 
     @property
@@ -408,10 +414,14 @@ class EventLogWidget(QWidget):
             # the category so old records still land in the correct tab.
             if event.category in ("RESOURCE_PRESSURE_RISK", "CPU Pressure Stall", "I/O Pressure Stall"):
                 source = "pressure"
+            elif event.category in {"FRAME_SPIKE", "CPU_STAGE_STALL", "TRANSIENT_DISTURBANCE", "LOCAL_STUTTER", "UNDETERMINED"}:
+                source = "minor"
             else:
                 source = "frame"
         if self._filter_mode == "pressure":
             return source in ("pressure", "system", "compat_pressure")
+        if self._filter_mode == "minor":
+            return source == "minor"
         return source in ("frame", "compat")
 
     def _on_filter_changed(self, mode: str):
@@ -435,9 +445,29 @@ class EventLogWidget(QWidget):
         self._empty_label.setVisible(not has_rows)
         if self._filter_mode == "pressure":
             self._empty_label.setText("暂时没有系统压力事件。\n系统资源压力较高时会在此提示。")
+        elif self._filter_mode == "minor":
+            self._empty_label.setText("暂时没有轻微干扰事件。\n短暂抖动或瞬时干扰会在此提示。")
         else:
             self._empty_label.setText("暂时还没有卡顿事件。\n正在持续监控你的系统…")
         self._clear_all_btn.setEnabled(self._total_count > 0)
+
+    def replace_events(self, events: list[LagEvent], total_count: int | None = None):
+        self.setUpdatesEnabled(False)
+        try:
+            self.clear_events()
+            for event in events:
+                if not self._matches_filter(event):
+                    continue
+                row = EventRow(event)
+                row.clicked.connect(self._on_row_clicked)
+                row.delete_requested.connect(self.event_delete_requested.emit)
+                self._rows.append(row)
+                self._list_layout.insertWidget(self._list_layout.count() - 1, row)
+            if total_count is not None:
+                self._total_count = max(0, int(total_count), len(self._rows))
+            self._refresh_state()
+        finally:
+            self.setUpdatesEnabled(True)
 
     def _maybe_request_more_history(self):
         if self._loading_more or len(self._rows) >= self._total_count:
