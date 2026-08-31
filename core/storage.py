@@ -163,6 +163,13 @@ class Storage:
                 f"WHERE category IN ({minor_list}) "
                 "AND detection_source IN ('', 'frame', 'compat', 'system')"
             )
+            # Composite index so tab-switch queries (filter by detection_source,
+            # order by started_at DESC) use an index scan instead of a full
+            # table scan.  Created once, idempotent.
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_lag_events_source_started "
+                "ON lag_events (detection_source, started_at DESC)"
+            )
             snapshot_existing = {
                 row[1]
                 for row in conn.exec_driver_sql("PRAGMA table_info(lag_snapshots)").fetchall()
@@ -302,27 +309,50 @@ class Storage:
         event_type: str | None = None,
     ) -> list[LagEvent]:
         with Session(self._engine) as session:
-            stmt = select(LagEventRow)
-            if event_type == "pressure":
-                stmt = stmt.where(
-                    LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
-                    | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
-                )
-            elif event_type == "minor":
-                stmt = stmt.where(LagEventRow.detection_source == "minor")
-            elif event_type == "stutter":
-                stmt = stmt.where(
-                    LagEventRow.detection_source.in_(("frame", "compat"))
-                    & (LagEventRow.category != "RESOURCE_PRESSURE_RISK")
-                )
-            stmt = (
-                stmt
-                .order_by(LagEventRow.started_at.desc())
-                .offset(offset)
-                .limit(limit)
-            )
+            stmt = self._event_filter_stmt(event_type)
+            stmt = stmt.order_by(LagEventRow.started_at.desc()).offset(offset).limit(limit)
             rows = session.scalars(stmt).all()
             return [self._row_to_event(r) for r in rows]
+
+    def get_recent_events_with_count(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: str | None = None,
+    ) -> tuple[list[LagEvent], int]:
+        """Fetch a page of events and the total count in one Session.
+
+        Tab-switching used to call event_count() and get_recent_events()
+        separately, each opening its own connection and doing a full table
+        scan.  This collapses them into a single connection / single pass.
+        """
+        from sqlalchemy import func
+        with Session(self._engine) as session:
+            base = self._event_filter_stmt(event_type)
+            rows = session.scalars(
+                base.order_by(LagEventRow.started_at.desc()).offset(offset).limit(limit)
+            ).all()
+            events = [self._row_to_event(r) for r in rows]
+            count = session.scalar(select(func.count()).select_from(base.subquery())) or 0
+            return events, count
+
+    @staticmethod
+    def _event_filter_stmt(event_type: str | None):
+        """Shared WHERE-clause builder for event tab queries."""
+        stmt = select(LagEventRow)
+        if event_type == "pressure":
+            stmt = stmt.where(
+                LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
+                | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
+            )
+        elif event_type == "minor":
+            stmt = stmt.where(LagEventRow.detection_source == "minor")
+        elif event_type == "stutter":
+            stmt = stmt.where(
+                LagEventRow.detection_source.in_(("frame", "compat"))
+                & (LagEventRow.category != "RESOURCE_PRESSURE_RISK")
+            )
+        return stmt
 
     def get_snapshot_for_event(self, event_id: int) -> LagSnapshot | None:
         with Session(self._engine) as session:
@@ -340,19 +370,8 @@ class Storage:
     def event_count(self, event_type: str | None = None) -> int:
         with Session(self._engine) as session:
             from sqlalchemy import func
-            stmt = select(func.count()).select_from(LagEventRow)
-            if event_type == "pressure":
-                stmt = stmt.where(
-                    LagEventRow.detection_source.in_(("pressure", "system", "compat_pressure"))
-                    | (LagEventRow.category == "RESOURCE_PRESSURE_RISK")
-                )
-            elif event_type == "minor":
-                stmt = stmt.where(LagEventRow.detection_source == "minor")
-            elif event_type == "stutter":
-                stmt = stmt.where(
-                    LagEventRow.detection_source.in_(("frame", "compat"))
-                    & (LagEventRow.category != "RESOURCE_PRESSURE_RISK")
-                )
+            base = Storage._event_filter_stmt(event_type)
+            stmt = select(func.count()).select_from(base.subquery())
             return session.scalar(stmt) or 0
 
     # ------------------------------------------------------------------

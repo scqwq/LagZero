@@ -1861,8 +1861,7 @@ class MainWindow(QMainWindow):
         event_type = self._event_log.filter_mode
 
         def _worker():
-            count = self._storage.event_count(event_type)
-            events = self._storage.get_recent_events(
+            events, count = self._storage.get_recent_events_with_count(
                 limit=HISTORY_PAGE_SIZE, event_type=event_type
             )
             self.history_loaded.emit({

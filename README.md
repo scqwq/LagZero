@@ -21,7 +21,7 @@
 
 - `Windows` 系统。
 - `Python 3.10+`。
-- 需要管理员权限运行；程序会通过 `core/elevation.py` 自动尝试 UAC 提权重启。
+- 可能需要管理员权限运行；程序会通过 `core/elevation.py` 自动尝试 UAC 提权重启。
 - 依赖 `Intel PresentMon 2.5.1`。项目已按当前目录结构接入 `tools/PresentMon/PresentMon-2.5.1-x64.exe`。
 - UI 使用 `PySide6 / Qt`，系统采样使用 `psutil`，本地历史记录使用 `SQLite + SQLAlchemy`。
 
