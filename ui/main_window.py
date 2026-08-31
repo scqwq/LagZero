@@ -619,6 +619,9 @@ class MainWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         actions_row.addStretch()
+        self._save_settings_btn = QPushButton("保存设置")
+        self._save_settings_btn.clicked.connect(self._save_pressure_settings_now)
+        actions_row.addWidget(self._save_settings_btn)
         self._reset_thresholds_btn = QPushButton("恢复默认阈值")
         self._reset_thresholds_btn.clicked.connect(self._reset_pressure_settings)
         actions_row.addWidget(self._reset_thresholds_btn)
@@ -1133,6 +1136,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _save_pressure_settings_now(self):
         save_settings(self._pressure_settings)
+        self._set_status_message("设置已保存", force=True)
 
     @Slot()
     def _reset_pressure_settings(self):

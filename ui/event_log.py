@@ -454,14 +454,17 @@ class EventLogWidget(QWidget):
     def replace_events(self, events: list[LagEvent], total_count: int | None = None):
         self.setUpdatesEnabled(False)
         try:
-            self.clear_events()
+            new_rows: list[EventRow] = []
             for event in events:
                 if not self._matches_filter(event):
                     continue
                 row = EventRow(event)
                 row.clicked.connect(self._on_row_clicked)
                 row.delete_requested.connect(self.event_delete_requested.emit)
-                self._rows.append(row)
+                new_rows.append(row)
+            self.clear_events()
+            self._rows.extend(new_rows)
+            for row in new_rows:
                 self._list_layout.insertWidget(self._list_layout.count() - 1, row)
             if total_count is not None:
                 self._total_count = max(0, int(total_count), len(self._rows))
