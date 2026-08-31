@@ -318,6 +318,17 @@ class MainWindow(QMainWindow):
         self._history_loading = False
         self._selected_event_id: int | None = None
         self._selected_event_ref: LagEvent | None = None
+        self._remembered_selection_ids: dict[str, int | None] = {
+            "stutter": None,
+            "minor": None,
+            "pressure": None,
+        }
+        self._remembered_selection_refs: dict[str, LagEvent | None] = {
+            "stutter": None,
+            "minor": None,
+            "pressure": None,
+        }
+        self._current_filter_mode = "stutter"
         self._last_metrics_ui_ts = 0.0
         self._last_statusbar_text = ""
         self._last_statusbar_ts = 0.0
@@ -833,6 +844,50 @@ class MainWindow(QMainWindow):
     def _is_pressure_only_category(category: str) -> bool:
         return (category or "").strip() in PRESSURE_ONLY_CATEGORIES
 
+    @staticmethod
+    def _is_minor_frame_episode(
+        category: str,
+        episode: FrameStutterEpisode,
+    ) -> bool:
+        normalized = (category or "").strip()
+        if episode.present_mode == "compatibility":
+            return False
+        if normalized in PRESSURE_ONLY_CATEGORIES:
+            return False
+        if normalized == "DISPLAY_PIPELINE":
+            return False
+        if episode.event_type in {"FRAME_FREEZE", "FRAME_DROP"}:
+            return False
+        if episode.freeze_frame_count > 0 or episode.dropped_frame_count > 0:
+            return False
+        if episode.display_stall_major_count > 0:
+            return False
+        if episode.peak_frame_time_ms >= 160.0:
+            return False
+        baseline = max(episode.baseline_frame_time_ms, 1.0)
+        if episode.peak_frame_time_ms >= baseline * 5.5 and episode.peak_frame_time_ms >= 85.0:
+            return False
+        duration_s = max(0.0, (episode.ended_at - episode.started_at).total_seconds())
+        if duration_s >= 0.40 and episode.peak_frame_time_ms >= 70.0:
+            return False
+        return episode.event_type == "FRAME_SPIKE" or episode.peak_frame_time_ms < 90.0
+
+    @staticmethod
+    def _is_minor_display_pipeline(episode: FrameStutterEpisode) -> bool:
+        if episode.category != "DISPLAY_PIPELINE":
+            return False
+        if episode.present_mode == "compatibility":
+            return False
+        if episode.dropped_frame_count:
+            return False
+        if episode.display_stall_major_count > 0:
+            return False
+        if episode.peak_display_excess_ms >= 30.0:
+            return False
+        if episode.peak_display_gap_ms >= max(episode.peak_frame_time_ms * 2.4, 50.0):
+            return False
+        return episode.display_stall_minor_count > 0
+
     def _resolve_detection_source(
         self,
         category: str,
@@ -853,6 +908,10 @@ class MainWindow(QMainWindow):
             return "compat"
         if self._is_pressure_only_category(normalized):
             return "pressure"
+        if normalized == "DISPLAY_PIPELINE" and self._is_minor_display_pipeline(episode):
+            return "minor"
+        if self._is_minor_frame_episode(normalized, episode):
+            return "minor"
         if normalized in MINOR_INTERFERENCE_CATEGORIES:
             return "minor"
         return "frame"
@@ -1035,6 +1094,9 @@ class MainWindow(QMainWindow):
     def _on_event_selected(self, event: LagEvent):
         self._selected_event_ref = event
         self._selected_event_id = event.id
+        mode = self._event_log.filter_mode
+        self._remembered_selection_ids[mode] = event.id
+        self._remembered_selection_refs[mode] = event
         self._selection_load_timer.start()
 
     def _cache_snapshot(self, event_id: int, snapshot: LagSnapshot | None):
@@ -1671,8 +1733,13 @@ class MainWindow(QMainWindow):
         if snapshot is not None:
             snapshot.id = snapshot_id
             self._cache_snapshot(event_id, snapshot)
+        for mode, remembered_ref in list(self._remembered_selection_refs.items()):
+            if remembered_ref is event:
+                self._remembered_selection_ids[mode] = event_id
+                self._remembered_selection_refs[mode] = event
         if self._selected_event_ref is event and not self._selection_load_timer.isActive():
             self._selected_event_id = event_id
+            self._remembered_selection_ids[self._event_log.filter_mode] = event_id
             self._detail_panel.show_event(event, snapshot)
 
     def _refresh_event_count_async(self):
@@ -1753,6 +1820,14 @@ class MainWindow(QMainWindow):
             self._history_offset = len(events)
             self._history_loading = False
             self._event_count_label.setText(f"{self._filter_label(mode)}：{count} 条")
+            remembered_id = self._remembered_selection_ids.get(mode)
+            if remembered_id:
+                restored = self._event_log.select_event_by_id(remembered_id)
+                if restored is not None:
+                    self._selected_event_ref = restored
+                    self._selected_event_id = restored.id
+                    self._remembered_selection_refs[mode] = restored
+                    self._load_selected_event()
             return
         self._event_log.append_history(events)
         self._history_offset += len(events)
@@ -1779,11 +1854,16 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_event_filter_changed(self, mode: str):
+        previous_mode = self._current_filter_mode
+        if self._selected_event_ref is not None:
+            self._remembered_selection_ids[previous_mode] = self._selected_event_ref.id
+            self._remembered_selection_refs[previous_mode] = self._selected_event_ref
         self._history_offset = 0
         self._history_loading = False
         self._selected_event_id = None
         self._selected_event_ref = None
         self._detail_panel.clear_event()
+        self._current_filter_mode = mode
         self._load_history()
 
     @Slot()
@@ -2097,7 +2177,9 @@ class MainWindow(QMainWindow):
         # 0.3-confidence guess being printed as the cause.
         if attribution is not None and attribution.category and attribution.is_confident:
             return attribution.category
-        if episode.dropped_frame_count:
+        if episode.dropped_frame_count >= 2 or episode.display_stall_major_count > 0:
+            return "DISPLAY_PIPELINE"
+        if episode.display_stall_minor_count > 0:
             return "DISPLAY_PIPELINE"
         return "LOCAL_STUTTER"
 

@@ -75,6 +75,13 @@ SCHEDULER_BG_MIN_SHARE = 10.0 # background process at/above this = preemption ri
 # but the frame detector reached something specific (e.g. GPU_BOUND from frame
 # telemetry), the frame-side answer is the better one to show.
 WEAK_CATEGORIES = frozenset({CATEGORY_UNDETERMINED, CATEGORY_LOCAL_STUTTER})
+PRESSURE_CONTEXT_CATEGORIES = frozenset({
+    CATEGORY_SYSTEM_RAM_PRESSURE,
+    CATEGORY_GAME_MEMORY_LIMIT,
+    CATEGORY_VRAM_PRESSURE,
+    CATEGORY_BACKGROUND_INTERFERENCE,
+    CATEGORY_IO_STALL,
+})
 
 
 @dataclass
@@ -169,11 +176,15 @@ class CauseAnalyzer:
         # classification carries more information than the system rules.
         system_is_weak = system_category in WEAK_CATEGORIES
         detector_is_specific = bool(detector_category) and detector_category not in WEAK_CATEGORIES
+        major_frame = self._is_major_frame_episode(episode)
 
-        if system_is_weak and detector_is_specific:
+        if detector_is_specific and (system_is_weak or major_frame):
+            explanation = episode.explanation
+            if system_category in PRESSURE_CONTEXT_CATEGORIES and system_cause:
+                explanation = f"{explanation} {system_cause}".strip()
             return FrameCauseResult(
                 category=detector_category,
-                explanation=f"{episode.explanation} {system_cause}".strip(),
+                explanation=explanation,
                 scope=detector_scope or system_scope,
                 frame_summary=frame_summary,
                 system_cause=system_cause,
@@ -188,6 +199,28 @@ class CauseAnalyzer:
             system_cause=system_cause,
             used_system_cause=True,
         )
+
+    @staticmethod
+    def _is_major_frame_episode(episode: FrameStutterEpisode) -> bool:
+        duration_s = max(0.0, (episode.ended_at - episode.started_at).total_seconds())
+        if episode.present_mode == "compatibility":
+            return True
+        if episode.event_type in {"FRAME_FREEZE", "FRAME_DROP"}:
+            return True
+        if episode.freeze_frame_count > 0:
+            return True
+        if episode.dropped_frame_count >= 2:
+            return True
+        if episode.display_stall_major_count > 0:
+            return True
+        if episode.peak_frame_time_ms >= 220.0:
+            return True
+        baseline = max(episode.baseline_frame_time_ms, 1.0)
+        if episode.peak_frame_time_ms >= baseline * 6.0 and episode.peak_frame_time_ms >= 90.0:
+            return True
+        if duration_s >= 0.45 and episode.peak_frame_time_ms >= 80.0:
+            return True
+        return False
 
     def _refine_frame_verdict(
         self,

@@ -54,21 +54,30 @@ FREEZE_MARGIN_MS = 120.0
 # several times its own norm is a hitch at ANY refresh rate.
 SPIKE_RATIO = 2.0
 STUTTER_RATIO = 3.5
-DISPLAY_MARGIN_MS = 6.0
+DISPLAY_MARGIN_MS = 8.0
 # Display floors are a RATIO, not milliseconds: a fixed 22 ms floor would flag
 # every frame of a 30 fps game (33 ms display intervals are normal there). What
 # is perceptible is the screen going quiet for much longer than its own rhythm.
-DISPLAY_FLOOR_RATIO = 2.0
+DISPLAY_FLOOR_RATIO = 2.2
+DISPLAY_RECENT_WINDOW_SAMPLES = 10
+DISPLAY_MINOR_CLUSTER_COUNT = 2
+DISPLAY_MAJOR_CLUSTER_COUNT = 3
 
 SPIKE_SIGMAS = 3.0
 STUTTER_SIGMAS = 5.0
-DISPLAY_SIGMAS = 4.0
+DISPLAY_SIGMAS = 4.5
 # A frame submitted quickly but shown much later than it was submitted. The
 # display gap only means something independent when it exceeds the frame's own
 # cost — otherwise it is just the frame being slow, which the frame thresholds
 # already catch, and the two detectors would fire together on one event.
-DISPLAY_LAG_RATIO = 1.5
-DISPLAY_LAG_FLOOR_MS = 8.0
+DISPLAY_LAG_RATIO = 1.8
+DISPLAY_LAG_FLOOR_MS = 12.0
+DISPLAY_MAJOR_EXCESS_MS = 28.0
+DISPLAY_MAJOR_RATIO = 2.4
+DISPLAY_DIRECT_EXCESS_MS = 42.0
+DISPLAY_DIRECT_RATIO = 3.0
+DISPLAY_FREEZE_EXCESS_MS = 120.0
+DISPLAY_FREEZE_GAP_MS = 180.0
 
 BASELINE_MIN_FRAMES = 120
 MIN_WINDOW_SAMPLES = 12
@@ -186,6 +195,15 @@ class FrameStutterDetector(QObject):
         self._episode_frames += 1
         if sample.was_displayed:
             self._peak_display_gap = max(self._peak_display_gap, sample.displayed_time_ms)
+            self._peak_display_excess = max(
+                self._peak_display_excess,
+                self._display_excess(sample),
+            )
+            if event_kind == "DISPLAY_STALL":
+                if self._last_display_stall_level >= 2:
+                    self._display_stall_major_count += 1
+                elif self._last_display_stall_level >= 1:
+                    self._display_stall_minor_count += 1
         else:
             self._dropped_frames += 1
         if sample.frame_time_ms >= self._spike_threshold():
@@ -291,10 +309,9 @@ class FrameStutterDetector(QObject):
         # The display side is only its own stutter class when the screen went
         # quiet for longer than the frame itself cost (submitted on time, shown
         # late) or beyond this game's learned display rhythm.
-        if sample.displayed_time_ms >= self._display_threshold() and (
-            sample.displayed_time_ms >= frame_ms * DISPLAY_LAG_RATIO
-            or sample.displayed_time_ms - frame_ms >= DISPLAY_LAG_FLOOR_MS
-        ):
+        display_level = self._display_stall_level(sample)
+        if display_level > 0:
+            self._last_display_stall_level = display_level
             return True, "DISPLAY_STALL"
 
         spike_threshold = self._spike_threshold()
@@ -324,13 +341,17 @@ class FrameStutterDetector(QObject):
         self._peak_gpu_busy = 0.0
         self._peak_gpu_wait = 0.0
         self._peak_display_gap = 0.0
+        self._peak_display_excess = 0.0
         self._peak_input_latency = 0.0
         self._slow_frame_count = 0
         self._freeze_frame_count = 0
         self._dropped_frames = 0
         self._episode_frames = 0
+        self._display_stall_minor_count = 0
+        self._display_stall_major_count = 0
         self._peak_kind = "FRAME_SPIKE"
         self._calm_ms = 0.0
+        self._last_display_stall_level = 0
         self._metrics_version = getattr(self, "_metrics_version", "v2")
 
     def _finish_episode(self, ended_at: datetime):
@@ -380,6 +401,9 @@ class FrameStutterDetector(QObject):
             peak_cpu_busy_ms=self._peak_cpu_busy,
             peak_gpu_wait_ms=self._peak_gpu_wait,
             peak_input_latency_ms=self._peak_input_latency,
+            display_stall_minor_count=self._display_stall_minor_count,
+            display_stall_major_count=self._display_stall_major_count,
+            peak_display_excess_ms=self._peak_display_excess,
             attribution=attribution,
         )
 
@@ -481,3 +505,65 @@ class FrameStutterDetector(QObject):
             "FRAME_DROP": 4,
             "FRAME_FREEZE": 5,
         }.get(kind, 0)
+
+    def _display_excess(self, sample: FrameSample) -> float:
+        if not sample.was_displayed:
+            return 0.0
+        display_norm = self._display_base.mean if self._display_base.mean > 0.0 else sample.frame_time_ms
+        expected_gap = max(sample.frame_time_ms, display_norm)
+        return max(0.0, sample.displayed_time_ms - expected_gap)
+
+    def _is_minor_display_anomaly(self, sample: FrameSample) -> bool:
+        if not sample.was_displayed:
+            return False
+        threshold = self._display_threshold()
+        if threshold == float("inf"):
+            return False
+        display_excess = self._display_excess(sample)
+        if display_excess <= 0.0:
+            return False
+        return sample.displayed_time_ms >= threshold and (
+            sample.displayed_time_ms >= sample.frame_time_ms * DISPLAY_LAG_RATIO
+            or display_excess >= DISPLAY_LAG_FLOOR_MS
+        )
+
+    def _is_major_display_anomaly(self, sample: FrameSample) -> bool:
+        if not self._is_minor_display_anomaly(sample):
+            return False
+        threshold = self._display_threshold()
+        display_excess = self._display_excess(sample)
+        return (
+            sample.displayed_time_ms >= max(threshold * 1.25, sample.frame_time_ms * DISPLAY_MAJOR_RATIO)
+            or display_excess >= max(DISPLAY_MAJOR_EXCESS_MS, self._display_base.mean * 0.75)
+        )
+
+    def _display_stall_level(self, sample: FrameSample) -> int:
+        if not self._is_minor_display_anomaly(sample):
+            return 0
+        threshold = self._display_threshold()
+        display_excess = self._display_excess(sample)
+        direct_major = (
+            sample.displayed_time_ms >= max(threshold * 1.5, sample.frame_time_ms * DISPLAY_DIRECT_RATIO)
+            or display_excess >= max(DISPLAY_DIRECT_EXCESS_MS, self._display_base.mean * 1.1)
+        )
+        if (
+            sample.displayed_time_ms >= DISPLAY_FREEZE_GAP_MS
+            or display_excess >= DISPLAY_FREEZE_EXCESS_MS
+        ):
+            return 2
+        if direct_major:
+            return 2
+
+        recent_displayed = [
+            frame for frame in list(self._recent_frames)[-DISPLAY_RECENT_WINDOW_SAMPLES:]
+            if frame.was_displayed
+        ]
+        minor_hits = sum(1 for frame in recent_displayed if self._is_minor_display_anomaly(frame))
+        major_hits = sum(1 for frame in recent_displayed if self._is_major_display_anomaly(frame))
+        if major_hits >= DISPLAY_MAJOR_CLUSTER_COUNT:
+            return 2
+        if self._is_major_display_anomaly(sample) and major_hits >= DISPLAY_MINOR_CLUSTER_COUNT:
+            return 2
+        if minor_hits >= DISPLAY_MINOR_CLUSTER_COUNT:
+            return 1
+        return 0

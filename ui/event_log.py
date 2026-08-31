@@ -439,6 +439,19 @@ class EventLogWidget(QWidget):
                 break
         self.event_selected.emit(event)
 
+    def select_event_by_id(self, event_id: int) -> LagEvent | None:
+        if not event_id:
+            return None
+        if self._selected_row:
+            self._selected_row.set_selected(False)
+            self._selected_row = None
+        for row in self._rows:
+            if row._lag_event.id == event_id:
+                row.set_selected(True)
+                self._selected_row = row
+                return row._lag_event
+        return None
+
     def _refresh_state(self):
         self._count_label.setText(str(self._total_count))
         has_rows = self._total_count > 0

@@ -298,6 +298,9 @@ class FrameStutterEpisode:
     peak_cpu_busy_ms: float = 0.0
     peak_gpu_wait_ms: float = 0.0
     peak_input_latency_ms: float = 0.0
+    display_stall_minor_count: int = 0
+    display_stall_major_count: int = 0
+    peak_display_excess_ms: float = 0.0
     attribution: Optional[FrameAttribution] = None
 
 
