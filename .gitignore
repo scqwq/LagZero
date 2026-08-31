@@ -23,7 +23,6 @@ data/pressure_settings.json
 data/spinbox_*.png
 
 # PyInstaller
-dist/
 build/
 
 # IDE
