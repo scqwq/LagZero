@@ -496,6 +496,7 @@ class DetailPanelWidget(QWidget):
 
     def _cause_text_zh(self, event: LagEvent, snapshot: LagSnapshot, code: str) -> str:
         top_proc = snapshot.top_processes[0] if snapshot.top_processes else None
+        is_minor = (event.detection_source or "").strip() == "minor"
         if code == "RESOURCE_PRESSURE_RISK":
             if event.cause:
                 return event.cause
@@ -510,64 +511,150 @@ class DetailPanelWidget(QWidget):
             if share <= 0.0:
                 # Old snapshots may not have machine_share; compute it here.
                 share = top_proc.cpu_percent / machine_cpu_count()
-            return f"检测到进程 {top_proc.name} (PID {top_proc.pid}) 的 CPU 占用达到整机 {share:.1f}%（约 {top_proc.cpu_percent:.1f}% 单核计），很可能它是导致本次卡顿的主要原因。"
+            return self._report_brief(
+                "更像 CPU 资源已经被明显吃满，游戏抢不到足够的计算时间。",
+                f"峰值时 {top_proc.name} (PID {top_proc.pid}) 占到整机 {share:.1f}% CPU，属于可以直接拖慢系统的级别。",
+                "先关闭或限制这个高占用进程，再观察卡顿是否明显减少；若它就是游戏本体，可优先降低偏 CPU 的画面/物理选项或限制帧率。",
+            )
         if code == "CPU_STAGE_STALL":
             target = snapshot.peak_sample.target_process
             if target is not None and target.cpu_machine_share > 0:
-                return (
-                    f"游戏自身的 CPU 阶段耗时增加，但整机 CPU 并未吃满"
-                    f"（游戏约占整机 {target.cpu_machine_share:.1f}%）。"
-                    f"这更像是游戏引擎的单线程瓶颈、锁竞争或内部等待，"
-                    f"而不是整机 CPU 资源不足。"
+                return self._report_brief(
+                    "更像游戏自己的 CPU 阶段突然变慢，而不是整机 CPU 完全不够。",
+                    f"游戏约占整机 {target.cpu_machine_share:.1f}% CPU，但整机没有明显吃满，范围已缩到主线程、锁竞争或引擎内部等待这一侧。",
+                    "优先降低偏 CPU 的设置，关闭后台干扰，并观察是否总在同类场景反复出现；若总在固定场景触发，更像游戏内容或引擎侧卡点。",
                 )
-            return (
-                "游戏自身的 CPU 阶段耗时增加，但整机 CPU 并未吃满。"
-                "这更像是游戏引擎的单线程瓶颈、锁竞争或内部等待，"
-                "而不是整机 CPU 资源不足。"
+            return self._report_brief(
+                "更像游戏自己的 CPU 阶段突然变慢，而不是整机 CPU 完全不够。",
+                "整机 CPU 没有明显吃满，因此更接近主线程、锁竞争或引擎内部等待。",
+                "优先降低偏 CPU 的设置，关闭后台干扰，并观察是否总在同类场景反复出现。",
             )
         if code == "TRANSIENT_DISTURBANCE":
-            return (
-                "帧耗时增加，但整机 CPU 占用和游戏自身 CPU 都不高。"
-                "这类卡顿更可能来自窗口切换、焦点变化或瞬时系统干扰，"
-                "而不是持续的 CPU/GPU 瓶颈。"
+            return self._report_brief(
+                "更像一次瞬时干扰，不像持续的 CPU、GPU 或内存瓶颈。",
+                "帧变慢了，但整机 CPU 和游戏自身 CPU 都不高，范围更接近切窗口、焦点变化或短时系统打扰。",
+                "如果只是偶发，可先继续观察；若常伴随切屏、弹窗、录屏或悬浮层出现，优先从这些干扰源排查。",
             )
         if code == "GPU_BOUND":
-            return "本次卡顿更像 GPU 侧渲染压力过高导致的帧时间抖动。通常意味着显卡负载、分辨率、特效或驱动路径成为瓶颈。"
+            return self._report_brief(
+                "更像 GPU 渲染这段压力过高，显卡侧成为主要瓶颈。",
+                "本次额外耗时主要堆在 GPU 渲染阶段，不像单纯 CPU 或内存不足。",
+                "优先降低分辨率、阴影、特效、抗锯齿与体积效果；若只在烟雾、爆炸、复杂场景出现，基本就是显卡场景压力。",
+            )
         if code == "VRAM_PRESSURE":
-            return f"系统公开 GPU 统计显示，显存预算使用率已经非常高。这类卡顿常见于材质、贴图、分辨率或特效导致的显存压力，而不只是单纯算力不够。"
+            gpu = snapshot.peak_sample.gpu_memory
+            detail = ""
+            if gpu is not None and gpu.local_budget_mb > 0:
+                detail = f"本地显存预算占比约 {gpu.local_usage_ratio * 100:.0f}%。"
+            return self._report_brief(
+                "更像显存余量不足，而不只是纯 GPU 算力不够。",
+                f"显存预算已经很高。{detail}".strip(),
+                "优先降低贴图、分辨率、材质缓存和高显存占用特效；多开录屏、浏览器硬件加速或多屏环境也可能放大这类问题。",
+            )
         if code in {"RAM_EXHAUSTION", "RAM_PRESSURE", "SYSTEM_RAM_PRESSURE"}:
-            return f"系统内存压力较高，峰值内存占用约为 {snapshot.peak_ram:.0f}%。游戏可用内存余量不足时，容易出现加载慢、卡顿和帧时间抖动。"
+            return self._report_brief(
+                "更像系统内存余量不足，游戏开始受到内存压力影响。",
+                f"峰值系统内存占用约 {snapshot.peak_ram:.0f}%，这类卡顿常伴随加载变慢、分页和帧时间抖动。",
+                "优先关闭浏览器、启动器、录屏和大内存后台程序；如果经常发生，可考虑降低游戏内存占用或增加物理内存。",
+            )
         if code == "GAME_MEMORY_LIMIT":
             target = snapshot.peak_sample.target_process
             if target is not None:
-                return f"系统总内存并没有吃满，但游戏进程 {target.name} 的内存长期贴近一个较窄上限，这更像游戏自身、运行时或启动参数限制了它可实际使用的内存。"
-            return "系统总内存并没有吃满，但目标游戏进程像是被限制在较窄的内存使用上限内。"
+                return self._report_brief(
+                    "更像游戏进程自己的可用内存上限偏紧，而不是整机 RAM 完全不够。",
+                    f"{target.name} 的内存长期贴近较窄上限，但系统总内存并未同时吃满。",
+                    "优先检查启动参数、MOD、材质包和游戏自身内存设置；若只在长时间游玩后出现，也可怀疑游戏侧内存管理问题。",
+                )
+            return self._report_brief(
+                "更像游戏进程自己的可用内存上限偏紧，而不是整机 RAM 完全不够。",
+                "目标进程像是被限制在较窄的内存使用上限内。",
+                "优先检查启动参数、MOD、材质包和游戏自身内存设置。",
+            )
         if code in {"BACKGROUND_CLUSTER", "BACKGROUND_INTERFERENCE"}:
-            return "检测到多个后台进程同时占用资源，没有单一元凶，但它们叠加后很可能挤占了游戏的 CPU 时间片。"
+            return self._report_brief(
+                "更像多个后台程序叠加干扰，而不是单一硬件瓶颈。",
+                "没有唯一元凶，但多个后台进程同时占资源，容易一起抢走游戏需要的 CPU 时间片。",
+                "优先关闭浏览器、多标签页、下载器、录屏和扫描任务；若下一次峰值进程名单里总是同几类程序，先从它们下手。",
+            )
         if code == "DISPLAY_PIPELINE":
-            return (
-                "游戏把帧提交出去了，但这些帧没有按时出现在屏幕上。这类卡顿在帧时间上看不出来，"
-                "常见于垂直同步/帧生成设置、桌面合成、覆盖层，或显示器刷新链路上的问题。"
+            return self._report_brief(
+                "更像帧已经做出来了，但显示到屏幕这最后一步出现了延迟或抖动。",
+                "这次范围已经缩到上屏链路，而不是纯 CPU/GPU 算力不足；常见于切窗口、桌面合成、覆盖层、帧生成或显示链路短时波动。",
+                "如果只是偶发，先从切窗口和覆盖层排查；若反复出现，再检查全屏模式、驱动、同步设置和多屏/录屏环境。",
             )
         if code in {"DISK_IO", "IO_STALL"}:
-            return f"本次卡顿更像是磁盘或 IO 瓶颈。峰值系统响应延迟达到 {snapshot.peak_responsiveness_ms:.1f} ms，而这类问题常见于加载、解压、杀毒扫描或分页。"
+            return self._report_brief(
+                "更像磁盘或 IO 路径在拖慢系统，而不是单纯 CPU 或 GPU 不够。",
+                f"峰值系统响应延迟达到 {snapshot.peak_responsiveness_ms:.1f} ms，这类情况常见于加载、解压、杀毒扫描或分页。",
+                "优先暂停下载、解压、扫描和同步盘；若同时伴随内存紧张，也要把内存压力一起看。",
+            )
         if code == "DRIVER_RENDER_PATH":
-            return "本次卡顿更像驱动、桌面合成、覆盖层或渲染链路异常，而不是典型的 CPU、内存或磁盘瓶颈。这个结论会保持保守，因为当前没有直接读取驱动内部状态。"
+            return self._report_brief(
+                "更像驱动、Present 提交或渲染链路被卡住，不像典型的 CPU、RAM 或磁盘瓶颈。",
+                "范围已缩到驱动/呈现路径这一段，但还不能把原因唯一锁死；覆盖层、录屏、桌面合成和驱动异常都可能落在这里。",
+                "优先关闭覆盖层、录屏和悬浮监控，再观察；若持续复现，可尝试更新或回退显卡驱动，并切换全屏/无边框模式对比。",
+            )
         if code in {"SCHEDULER_CONTENTION", "LOCAL_STUTTER"}:
             if code == "SCHEDULER_CONTENTION":
-                return (
-                    "CPU 等待增加，同时检测到后台进程占用较高 CPU。"
-                    "游戏的线程可能被操作系统调度器抢占，导致帧提交被阻塞。"
-                    "可尝试关闭高占用的后台程序后再次测试。"
+                return self._report_brief(
+                    "更像游戏线程在抢 CPU 时间片时被后台程序打断了。",
+                    "CPU 等待上升，同时后台进程占用明显，范围已缩到调度抢占而不是单纯 GPU 或显存问题。",
+                    "先关闭高 CPU 后台程序、浏览器、录屏和下载器，再复测；如果改善明显，基本可以确认是资源争抢。",
                 )
-            return f"系统处于综合性压力状态。峰值 CPU {snapshot.peak_cpu:.0f}%，响应延迟 {snapshot.peak_responsiveness_ms:.1f} ms，暂未识别出唯一的根因。"
+            return self._report_brief(
+                "确认发生了本地卡顿，但暂时还没有足够强的证据把原因唯一锁定。",
+                f"峰值 CPU {snapshot.peak_cpu:.0f}%，响应延迟 {snapshot.peak_responsiveness_ms:.1f} ms；当前更像综合性压力或短时场景波动。",
+                "先观察它是否总和某一类场景、后台程序或资源压力一起出现；如果后续重复集中到同一类别，再优先按那条线排查。",
+            )
+        if code == "FRAME_PACING_COLLAPSE":
+            fps_ratio = 100.0
+            summary = ""
+            raw = (event.frame_summary or "").strip()
+            match = re.search(r"about ([\d.]+)% of normal", raw)
+            if match:
+                fps_ratio = float(match.group(1))
+                summary = f"短时间内有效帧率掉到正常的大约 {fps_ratio:.0f}%。"
+            return self._report_brief(
+                "更像不是一帧特别长，而是一小段时间内连续很多帧一起变差。",
+                summary or "这类卡顿常见于短时资源加载、后台争抢或场景复杂度瞬时上升。",
+                "优先结合当时场景看是否伴随转点、爆炸、烟雾、切界面或后台活动；若总在同类时机出现，就按那条线继续排查。",
+            )
         if code in {"FRAME_SPIKE", "FRAME_STUTTER", "FRAME_FREEZE", "FRAME_DROP", "DISPLAY_STALL"}:
-            return f"这是一次以帧时间异常为主的卡顿事件，持续约 {event.duration_seconds:.1f} 秒。当前报告更偏向玩家看到的结果，而不是完整硬件根因。"
+            if is_minor:
+                return self._report_brief(
+                    "确认出现了轻度帧级波动或短时掉速。",
+                    f"这次现象持续约 {event.duration_seconds:.1f} 秒，更接近玩家看到的结果；当前还不能唯一锁定硬件根因。",
+                    "若后续总伴随同一种归因或同类场景重复出现，再优先从那一侧排查。",
+                )
+            return self._report_brief(
+                "确认出现了明显的帧级卡顿或掉帧现象。",
+                f"这次报告更接近玩家看到的结果，持续约 {event.duration_seconds:.1f} 秒；若没有更具体归因，说明当前还不能唯一锁定硬件根因。",
+                "可结合同一时间的 CPU、RAM、显存和峰值进程继续判断；如果后续总伴随同一种归因，再优先从那一侧排查。",
+            )
         if code == "Window Not Responding":
-            return "游戏窗口在这段时间内出现了未响应现象，通常意味着主线程被阻塞，或游戏没有及时处理窗口消息。"
+            return self._report_brief(
+                "更像游戏窗口主线程被卡住，连窗口消息都没能及时处理。",
+                "这是比较重的本地异常，常见于主线程阻塞、极重加载或驱动等待。",
+                "优先排查后台干扰、磁盘/内存压力和驱动问题；若频繁出现，建议重点看游戏本体或 MOD。",
+            )
         if code == "Visual Freeze":
-            return "检测到画面长时间不变化，属于视觉冻结。它可能来自渲染线程停顿、资源加载阻塞，或驱动层等待。"
+            return self._report_brief(
+                "检测到画面长时间不变化，属于视觉冻结级别异常。",
+                "范围更接近渲染线程停顿、资源加载阻塞或驱动层等待。",
+                "优先观察是否总在加载、切场景或复杂特效时出现，并同步排查驱动、存储和内存压力。",
+            )
         return event.cause or "暂无详细说明。"
+
+    @staticmethod
+    def _report_brief(primary: str, context: str, action: str) -> str:
+        parts = [f"主判断：{primary}"]
+        context_text = (context or "").strip()
+        action_text = (action or "").strip()
+        if context_text:
+            parts.append(f"伴随线索：{context_text}")
+        if action_text:
+            parts.append(f"优先建议：{action_text}")
+        return "\n".join(parts)
 
     def _scope_label(self, scope: str) -> str:
         normalized = (scope or "UNDETERMINED").upper()

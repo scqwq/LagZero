@@ -73,6 +73,7 @@ HISTORY_PAGE_SIZE = 30
 TRAY_NOTIFY_CATEGORY_COOLDOWN_S = 120.0
 RISK_ALERT_INTERVALS_S = [15.0, 30.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1800.0]
 STUTTER_ALERT_INTERVALS_S = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+DISPLAY_PIPELINE_ALERT_INTERVALS_S = [10.0, 20.0, 40.0, 60.0, 90.0]
 MANUAL_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 AUTO_HIGH_PRECISION_RECOVERY_DURATION_S = 0
 STUTTER_REPORT_SOURCES = {"frame", "compat"}
@@ -370,6 +371,7 @@ class MainWindow(QMainWindow):
         )
         self._pressure_report_gate = ExponentialBackoffGate(RISK_ALERT_INTERVALS_S)
         self._stutter_report_gate = ExponentialBackoffGate(STUTTER_ALERT_INTERVALS_S)
+        self._display_pipeline_report_gate = ExponentialBackoffGate(DISPLAY_PIPELINE_ALERT_INTERVALS_S)
         self._last_pressure_findings = []
 
         self.setWindowTitle("LagLense")
@@ -970,7 +972,11 @@ class MainWindow(QMainWindow):
             return "minor"
         return "frame"
 
-    def _report_gate_for_source(self, source: str) -> ExponentialBackoffGate:
+    def _report_gate_for_event(self, event: LagEvent) -> ExponentialBackoffGate:
+        source = event.detection_source or "pressure"
+        category = event.category or event.cause_code or "UNKNOWN"
+        if source in STUTTER_REPORT_SOURCES and category == "DISPLAY_PIPELINE":
+            return self._display_pipeline_report_gate
         if source in STUTTER_REPORT_SOURCES:
             return self._stutter_report_gate
         return self._pressure_report_gate
@@ -999,7 +1005,7 @@ class MainWindow(QMainWindow):
         tray_message: str,
         suppressed_message: str,
     ) -> bool:
-        gate = self._report_gate_for_source(event.detection_source)
+        gate = self._report_gate_for_event(event)
         if not gate.allow(cooldown_key):
             self._event_log.remove_event(event)
             if self._selected_event_ref is event:
