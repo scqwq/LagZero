@@ -88,6 +88,9 @@ MIN_WINDOW_SAMPLES = 12
 CALM_TIME_TO_END_MS = 700.0
 CLUSTER_SLOW_COUNT = 3
 CLUSTER_STUTTER_COUNT = 5
+# Safety valve: if the episode has been active this long, force-end it and
+# emit a report even when minor spikes keep resetting the calm timer.
+MAX_EPISODE_DURATION_S = 5.0
 # A single dropped frame is a 4 ms longer gap at 240 Hz — invisible. Its
 # visible consequence (the previous frame staying up twice as long) is already
 # caught by the display-gap thresholds below, so the drop itself only counts as
@@ -149,6 +152,14 @@ class FrameStutterDetector(QObject):
                     f"{event_kind} detected for {self._target_process or 'unknown process'}"
                 )
                 self.stutter_started.emit(sample.timestamp)
+            elif self._started_at is not None:
+                elapsed = (sample.timestamp - self._started_at).total_seconds()
+                if elapsed >= MAX_EPISODE_DURATION_S:
+                    self._finish_episode(sample.timestamp)
+                    self._active = True
+                    self._started_at = sample.timestamp
+                    self._absorb(sample, event_kind)
+                    self.stutter_started.emit(sample.timestamp)
         elif self._active:
             self._calm_ms += max(sample.frame_time_ms, 1.0)
             if self._calm_ms >= CALM_TIME_TO_END_MS:
@@ -199,7 +210,8 @@ class FrameStutterDetector(QObject):
 
     def _absorb(self, sample: FrameSample, event_kind: str):
         """Fold one bad frame into the running peaks for the current episode."""
-        self._calm_ms = 0.0
+        if self._event_priority(event_kind) >= self._event_priority("FRAME_STUTTER"):
+            self._calm_ms = 0.0
         self._peak_frame_time = max(self._peak_frame_time, sample.frame_time_ms)
         self._peak_cpu_busy = max(self._peak_cpu_busy, sample.cpu_busy_ms)
         self._peak_cpu_wait = max(self._peak_cpu_wait, sample.cpu_wait_ms)

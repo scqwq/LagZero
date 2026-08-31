@@ -30,6 +30,11 @@
 ```bash
 python main.py
 ```
+conda下可能需要退出conda
+
+退出:
+
+Ctrl + C 或者关掉控制台即可
 
 ## 面板如何使用
 

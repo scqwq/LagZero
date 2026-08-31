@@ -468,18 +468,32 @@ class EventLogWidget(QWidget):
     def replace_events(self, events: list[LagEvent], total_count: int | None = None):
         self.setUpdatesEnabled(False)
         try:
-            new_rows: list[EventRow] = []
-            for event in events:
-                if not self._matches_filter(event):
-                    continue
-                row = EventRow(event)
-                row.clicked.connect(self._on_row_clicked)
-                row.delete_requested.connect(self.event_delete_requested.emit)
-                new_rows.append(row)
-            self.clear_events()
-            self._rows.extend(new_rows)
-            for row in new_rows:
-                self._list_layout.insertWidget(self._list_layout.count() - 1, row)
+            filtered = [e for e in events if self._matches_filter(e)]
+            # Reuse existing EventRow widgets: swap the event and refresh()
+            # instead of destroying + recreating ~30 QFrame subtrees on every
+            # tab switch.  Signal connections are already wired on reused rows.
+            reuse_count = min(len(filtered), len(self._rows))
+            for i in range(reuse_count):
+                self._rows[i]._lag_event = filtered[i]
+                self._rows[i].set_selected(False)
+                self._rows[i].refresh()
+            # Create rows for any surplus events
+            if len(filtered) > len(self._rows):
+                stretch_index = self._list_layout.count() - 1
+                for i in range(len(self._rows), len(filtered)):
+                    row = EventRow(filtered[i])
+                    row.clicked.connect(self._on_row_clicked)
+                    row.delete_requested.connect(self.event_delete_requested.emit)
+                    self._rows.append(row)
+                    self._list_layout.insertWidget(stretch_index, row)
+            # Destroy surplus rows that are no longer needed
+            elif len(filtered) < len(self._rows):
+                for row in self._rows[len(filtered):]:
+                    row.setParent(None)
+                    row.deleteLater()
+                del self._rows[len(filtered):]
+            self._selected_row = None
+            self._loading_more = False
             if total_count is not None:
                 self._total_count = max(0, int(total_count), len(self._rows))
             self._refresh_state()
